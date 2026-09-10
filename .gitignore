@@ -1,0 +1,8 @@
+# Rust build output
+ffi/target/
+
+# Static library produced by `make ffi`
+*.a
+
+# Go test binaries
+*.test

@@ -1,0 +1,15 @@
+[package]
+name = "regolith-ffi"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "regolith_ffi"
+crate-type = ["staticlib", "lib"]
+
+[dependencies]
+regolith = "0.1.4"
+
+[dev-dependencies]
+tempfile = "3"

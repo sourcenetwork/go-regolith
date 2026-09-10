@@ -1,0 +1,769 @@
+//! Integration tests that drive the C ABI the way cgo will: raw
+//! pointers, out-params, integer statuses, explicit frees.
+//!
+//! This is the gate on the FFI layer. The Go wrapper does not exist yet,
+//! so anything these tests do not cover is unverified.
+
+use std::ptr;
+
+use regolith_ffi::*;
+use tempfile::TempDir;
+
+// ---------------------------------------------------------------------
+// Thin Rust-side helpers over the C API. Deliberately not abstractions:
+// each one is exactly one FFI call plus the ownership dance the Go side
+// will have to do.
+// ---------------------------------------------------------------------
+
+fn open(dir: &TempDir) -> *mut RegolithDb {
+    let path = dir.path().to_str().unwrap().as_bytes();
+    let mut db: *mut RegolithDb = ptr::null_mut();
+    let status = unsafe { regolith_db_open(path.as_ptr(), path.len(), &raw mut db) };
+    assert_eq!(status, OK, "open failed: {:?}", last_error());
+    assert!(!db.is_null());
+    db
+}
+
+/// Copy an out-param buffer and release it, exactly as `C.GoBytes` plus
+/// `regolith_free_buf` will.
+fn take_buf(ptr: *mut u8, len: usize) -> Vec<u8> {
+    let copied = if len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+    };
+    unsafe { regolith_free_buf(ptr, len) };
+    copied
+}
+
+fn last_error() -> Option<String> {
+    let raw = regolith_last_error_message();
+    if raw.is_null() {
+        return None;
+    }
+    let message = unsafe { std::ffi::CStr::from_ptr(raw) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { regolith_free_string(raw) };
+    Some(message)
+}
+
+fn set(db: *mut RegolithDb, key: &[u8], value: &[u8]) {
+    let status = unsafe {
+        regolith_db_set(db, key.as_ptr(), key.len(), value.as_ptr(), value.len())
+    };
+    assert_eq!(status, OK, "set failed: {:?}", last_error());
+}
+
+fn get(db: *mut RegolithDb, key: &[u8]) -> Result<Vec<u8>, i32> {
+    let mut val: *mut u8 = ptr::null_mut();
+    let mut len: usize = 0;
+    let status =
+        unsafe { regolith_db_get(db, key.as_ptr(), key.len(), &raw mut val, &raw mut len) };
+    if status == OK {
+        Ok(take_buf(val, len))
+    } else {
+        Err(status)
+    }
+}
+
+fn has(db: *mut RegolithDb, key: &[u8]) -> bool {
+    let mut found: u8 = 2;
+    let status = unsafe { regolith_db_has(db, key.as_ptr(), key.len(), &raw mut found) };
+    assert_eq!(status, OK, "has failed: {:?}", last_error());
+    found == 1
+}
+
+fn txn_get(txn: *mut RegolithTxn, key: &[u8]) -> Result<Vec<u8>, i32> {
+    let mut val: *mut u8 = ptr::null_mut();
+    let mut len: usize = 0;
+    let status =
+        unsafe { regolith_txn_get(txn, key.as_ptr(), key.len(), &raw mut val, &raw mut len) };
+    if status == OK {
+        Ok(take_buf(val, len))
+    } else {
+        Err(status)
+    }
+}
+
+fn txn_set(txn: *mut RegolithTxn, key: &[u8], value: &[u8]) -> i32 {
+    unsafe { regolith_txn_set(txn, key.as_ptr(), key.len(), value.as_ptr(), value.len()) }
+}
+
+/// Build an options struct. The byte slices must outlive the
+/// `regolith_*_iter` call, which is why callers keep them in locals.
+fn opts(
+    prefix: Option<&[u8]>,
+    start: Option<&[u8]>,
+    end: Option<&[u8]>,
+    reverse: bool,
+    keys_only: bool,
+) -> RegolithIterOptions {
+    fn part(bytes: Option<&[u8]>) -> (*const u8, usize) {
+        match bytes {
+            Some(bytes) => (bytes.as_ptr(), bytes.len()),
+            None => (ptr::null(), 0),
+        }
+    }
+    let (prefix, prefix_len) = part(prefix);
+    let (start, start_len) = part(start);
+    let (end, end_len) = part(end);
+    RegolithIterOptions {
+        prefix,
+        prefix_len,
+        start,
+        start_len,
+        end,
+        end_len,
+        reverse: u8::from(reverse),
+        keys_only: u8::from(keys_only),
+    }
+}
+
+fn db_iter(db: *mut RegolithDb, opts: &RegolithIterOptions) -> *mut RegolithIter {
+    let mut it: *mut RegolithIter = ptr::null_mut();
+    let status = unsafe { regolith_db_iter(db, opts, &raw mut it) };
+    assert_eq!(status, OK, "db_iter failed: {:?}", last_error());
+    it
+}
+
+fn txn_iter(txn: *mut RegolithTxn, opts: &RegolithIterOptions) -> *mut RegolithIter {
+    let mut it: *mut RegolithIter = ptr::null_mut();
+    let status = unsafe { regolith_txn_iter(txn, opts, &raw mut it) };
+    assert_eq!(status, OK, "txn_iter failed: {:?}", last_error());
+    it
+}
+
+fn iter_next(it: *mut RegolithIter) -> bool {
+    let mut valid: u8 = 2;
+    let status = unsafe { regolith_iter_next(it, &raw mut valid) };
+    assert_eq!(status, OK, "iter_next failed: {:?}", last_error());
+    valid == 1
+}
+
+fn iter_seek(it: *mut RegolithIter, key: &[u8]) -> bool {
+    let mut valid: u8 = 2;
+    let status = unsafe { regolith_iter_seek(it, key.as_ptr(), key.len(), &raw mut valid) };
+    assert_eq!(status, OK, "iter_seek failed: {:?}", last_error());
+    valid == 1
+}
+
+fn iter_key(it: *mut RegolithIter) -> Vec<u8> {
+    let mut key: *mut u8 = ptr::null_mut();
+    let mut len: usize = 0;
+    let status = unsafe { regolith_iter_key(it, &raw mut key, &raw mut len) };
+    assert_eq!(status, OK, "iter_key failed: {:?}", last_error());
+    take_buf(key, len)
+}
+
+fn iter_value(it: *mut RegolithIter) -> Vec<u8> {
+    let mut val: *mut u8 = ptr::null_mut();
+    let mut len: usize = 0;
+    let status = unsafe { regolith_iter_value(it, &raw mut val, &raw mut len) };
+    assert_eq!(status, OK, "iter_value failed: {:?}", last_error());
+    take_buf(val, len)
+}
+
+/// Walk an iterator to exhaustion, collecting `(key, value)` as strings.
+fn drain(it: *mut RegolithIter) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    while iter_next(it) {
+        let key = String::from_utf8(iter_key(it)).unwrap();
+        let value = String::from_utf8(iter_value(it)).unwrap();
+        out.push((key, value));
+    }
+    out
+}
+
+fn keys(entries: &[(String, String)]) -> Vec<&str> {
+    entries.iter().map(|(k, _)| k.as_str()).collect()
+}
+
+/// Seed a store with `a..e` mapped to `va..ve`.
+fn seed(db: *mut RegolithDb) {
+    for key in ["a", "b", "c", "d", "e"] {
+        set(db, key.as_bytes(), format!("v{key}").as_bytes());
+    }
+}
+
+fn close(db: *mut RegolithDb) {
+    assert_eq!(unsafe { regolith_db_close(db) }, OK);
+}
+
+// ---------------------------------------------------------------------
+// Store
+// ---------------------------------------------------------------------
+
+#[test]
+fn noop_is_callable() {
+    regolith_noop();
+}
+
+#[test]
+fn null_handles_are_errors_not_crashes() {
+    assert_eq!(
+        unsafe { regolith_db_get(ptr::null_mut(), b"k".as_ptr(), 1, ptr::null_mut(), ptr::null_mut()) },
+        INVALID_ARG
+    );
+    assert_eq!(unsafe { regolith_db_close(ptr::null_mut()) }, INVALID_ARG);
+    assert_eq!(unsafe { regolith_txn_commit(ptr::null_mut()) }, INVALID_ARG);
+    assert_eq!(unsafe { regolith_iter_close(ptr::null_mut()) }, INVALID_ARG);
+    assert_eq!(
+        unsafe { regolith_iter_next(ptr::null_mut(), ptr::null_mut()) },
+        INVALID_ARG
+    );
+}
+
+#[test]
+fn open_and_close() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    close(db);
+
+    // Re-opening the same directory works and sees nothing.
+    let db = open(&dir);
+    assert_eq!(get(db, b"missing"), Err(NOT_FOUND));
+    close(db);
+}
+
+#[test]
+fn set_get_has_delete() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+
+    set(db, b"k", b"v");
+    assert_eq!(get(db, b"k").unwrap(), b"v");
+    assert!(has(db, b"k"));
+
+    // Overwrite.
+    set(db, b"k", b"v2");
+    assert_eq!(get(db, b"k").unwrap(), b"v2");
+
+    assert_eq!(unsafe { regolith_db_delete(db, b"k".as_ptr(), 1) }, OK);
+    assert_eq!(get(db, b"k"), Err(NOT_FOUND));
+    assert!(!has(db, b"k"));
+
+    // Deleting an absent key is not an error.
+    assert_eq!(unsafe { regolith_db_delete(db, b"k".as_ptr(), 1) }, OK);
+
+    close(db);
+}
+
+#[test]
+fn get_missing_returns_not_found() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    seed(db);
+    assert_eq!(get(db, b"zzz"), Err(NOT_FOUND));
+    assert!(!has(db, b"zzz"));
+    close(db);
+}
+
+#[test]
+fn drop_all_empties_the_store() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    seed(db);
+    assert!(has(db, b"c"));
+
+    assert_eq!(unsafe { regolith_db_drop_all(db) }, OK, "{:?}", last_error());
+
+    for key in ["a", "b", "c", "d", "e"] {
+        assert_eq!(get(db, key.as_bytes()), Err(NOT_FOUND), "{key} survived");
+    }
+    let options = opts(None, None, None, false, false);
+    let it = db_iter(db, &options);
+    assert!(drain(it).is_empty());
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    // Still usable afterwards.
+    set(db, b"fresh", b"v");
+    assert_eq!(get(db, b"fresh").unwrap(), b"v");
+    close(db);
+}
+
+// ---------------------------------------------------------------------
+// Iteration over the store
+// ---------------------------------------------------------------------
+
+#[test]
+fn forward_scan() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    seed(db);
+
+    let options = opts(None, None, None, false, false);
+    let it = db_iter(db, &options);
+    let entries = drain(it);
+    assert_eq!(keys(&entries), ["a", "b", "c", "d", "e"]);
+    assert_eq!(entries[2].1, "vc");
+    // Exhausted iterators stay exhausted.
+    assert!(!iter_next(it));
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    close(db);
+}
+
+#[test]
+fn reverse_scan() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    seed(db);
+
+    let options = opts(None, None, None, true, false);
+    let it = db_iter(db, &options);
+    let entries = drain(it);
+    assert_eq!(keys(&entries), ["e", "d", "c", "b", "a"]);
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    close(db);
+}
+
+#[test]
+fn prefix_scan_includes_the_bare_prefix_and_nothing_outside_it() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    for key in ["j9", "k", "k1", "k2", "l0"] {
+        set(db, key.as_bytes(), format!("v{key}").as_bytes());
+    }
+
+    let prefix = b"k";
+    let options = opts(Some(prefix), None, None, false, false);
+    let it = db_iter(db, &options);
+    // The corekv suite (TestIteratorPrefix_DoesNotReturnSelf) expects the
+    // key equal to the prefix to be yielded, despite what the doc comment
+    // on IterOptions.Prefix says.
+    assert_eq!(keys(&drain(it)), ["k", "k1", "k2"]);
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    let options = opts(Some(prefix), None, None, true, false);
+    let it = db_iter(db, &options);
+    assert_eq!(keys(&drain(it)), ["k2", "k1", "k"]);
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    // A prefix overrides start/end rather than intersecting with them.
+    let options = opts(Some(prefix), Some(b"a"), Some(b"zzz"), false, false);
+    let it = db_iter(db, &options);
+    assert_eq!(keys(&drain(it)), ["k", "k1", "k2"]);
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    close(db);
+}
+
+#[test]
+fn start_and_end_bounds_with_end_exclusive() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    seed(db);
+
+    let (start, end) = (b"b", b"d");
+
+    let options = opts(None, Some(start), Some(end), false, false);
+    let it = db_iter(db, &options);
+    // "d" is the exclusive end, so it must not appear.
+    assert_eq!(keys(&drain(it)), ["b", "c"]);
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    let options = opts(None, Some(start), Some(end), true, false);
+    let it = db_iter(db, &options);
+    assert_eq!(keys(&drain(it)), ["c", "b"]);
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    // Start alone, and end alone.
+    let options = opts(None, Some(b"c"), None, false, false);
+    let it = db_iter(db, &options);
+    assert_eq!(keys(&drain(it)), ["c", "d", "e"]);
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    let options = opts(None, None, Some(b"c"), false, false);
+    let it = db_iter(db, &options);
+    assert_eq!(keys(&drain(it)), ["a", "b"]);
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    close(db);
+}
+
+#[test]
+fn keys_only_suppresses_values() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    seed(db);
+
+    let options = opts(None, None, None, false, true);
+    let it = db_iter(db, &options);
+    assert!(iter_next(it));
+    assert_eq!(iter_key(it), b"a");
+    assert!(iter_value(it).is_empty());
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    close(db);
+}
+
+#[test]
+fn seek_forward_and_reverse() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    seed(db);
+
+    let options = opts(None, None, None, false, false);
+    let it = db_iter(db, &options);
+    // Exact hit.
+    assert!(iter_seek(it, b"c"));
+    assert_eq!(iter_key(it), b"c");
+    // Miss lands on the next key forward.
+    assert!(iter_seek(it, b"bb"));
+    assert_eq!(iter_key(it), b"c");
+    // Seek then continue.
+    assert!(iter_next(it));
+    assert_eq!(iter_key(it), b"d");
+    // Past the end.
+    assert!(!iter_seek(it, b"zzz"));
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    let options = opts(None, None, None, true, false);
+    let it = db_iter(db, &options);
+    // Reverse seek lands on the greatest key <= the target.
+    assert!(iter_seek(it, b"cc"));
+    assert_eq!(iter_key(it), b"c");
+    assert!(iter_next(it));
+    assert_eq!(iter_key(it), b"b");
+    // Before the beginning.
+    assert!(!iter_seek(it, b"0"));
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    close(db);
+}
+
+#[test]
+fn seek_is_clamped_to_the_configured_range() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    seed(db);
+
+    let (start, end) = (b"b", b"d");
+
+    let options = opts(None, Some(start), Some(end), false, false);
+    let it = db_iter(db, &options);
+    // Below `start` clamps up to `start`, it does not yield "a".
+    assert!(iter_seek(it, b"a"));
+    assert_eq!(iter_key(it), b"b");
+    // At or above the exclusive `end` is out of range.
+    assert!(!iter_seek(it, b"d"));
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    let options = opts(None, Some(start), Some(end), true, false);
+    let it = db_iter(db, &options);
+    // At or above `end` clamps down to the top of the range, not to "d".
+    assert!(iter_seek(it, b"zzz"));
+    assert_eq!(iter_key(it), b"c");
+    // Below `start` is out of range.
+    assert!(!iter_seek(it, b"a"));
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    close(db);
+}
+
+#[test]
+fn reset_allows_re_iteration() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    seed(db);
+
+    let options = opts(None, Some(b"b"), Some(b"e"), false, false);
+    let it = db_iter(db, &options);
+    assert_eq!(keys(&drain(it)), ["b", "c", "d"]);
+
+    assert_eq!(unsafe { regolith_iter_reset(it) }, OK);
+    assert_eq!(keys(&drain(it)), ["b", "c", "d"]);
+
+    // Reset mid-walk, and after a seek.
+    assert_eq!(unsafe { regolith_iter_reset(it) }, OK);
+    assert!(iter_next(it));
+    assert_eq!(iter_key(it), b"b");
+    assert!(iter_seek(it, b"d"));
+    assert_eq!(iter_key(it), b"d");
+    assert_eq!(unsafe { regolith_iter_reset(it) }, OK);
+    assert!(iter_next(it));
+    assert_eq!(iter_key(it), b"b");
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    // And in reverse.
+    let options = opts(None, Some(b"b"), Some(b"e"), true, false);
+    let it = db_iter(db, &options);
+    assert_eq!(keys(&drain(it)), ["d", "c", "b"]);
+    assert_eq!(unsafe { regolith_iter_reset(it) }, OK);
+    assert_eq!(keys(&drain(it)), ["d", "c", "b"]);
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    close(db);
+}
+
+#[test]
+fn store_iterator_sees_a_snapshot_from_its_creation() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    seed(db);
+
+    let options = opts(None, None, None, false, false);
+    let it = db_iter(db, &options);
+    set(db, b"bb", b"vbb");
+    assert_eq!(keys(&drain(it)), ["a", "b", "c", "d", "e"]);
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    let it = db_iter(db, &options);
+    assert_eq!(keys(&drain(it)), ["a", "b", "bb", "c", "d", "e"]);
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    close(db);
+}
+
+// ---------------------------------------------------------------------
+// Transactions
+// ---------------------------------------------------------------------
+
+fn begin(db: *mut RegolithDb, readonly: bool) -> *mut RegolithTxn {
+    let mut txn: *mut RegolithTxn = ptr::null_mut();
+    let status = unsafe { regolith_db_txn(db, u8::from(readonly), &raw mut txn) };
+    assert_eq!(status, OK, "begin failed: {:?}", last_error());
+    assert!(!txn.is_null());
+    txn
+}
+
+#[test]
+fn txn_commit_is_visible() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    seed(db);
+
+    let txn = begin(db, false);
+    assert_eq!(txn_set(txn, b"f", b"vf"), OK);
+    assert_eq!(unsafe { regolith_txn_delete(txn, b"a".as_ptr(), 1) }, OK);
+
+    // The transaction sees its own writes; the store does not, yet.
+    assert_eq!(txn_get(txn, b"f").unwrap(), b"vf");
+    assert_eq!(txn_get(txn, b"a"), Err(NOT_FOUND));
+    assert_eq!(get(db, b"f"), Err(NOT_FOUND));
+    assert_eq!(get(db, b"a").unwrap(), b"va");
+
+    assert_eq!(
+        unsafe { regolith_txn_commit(txn) },
+        OK,
+        "{:?}",
+        last_error()
+    );
+    assert_eq!(unsafe { regolith_txn_free(txn) }, OK);
+
+    assert_eq!(get(db, b"f").unwrap(), b"vf");
+    assert_eq!(get(db, b"a"), Err(NOT_FOUND));
+
+    close(db);
+}
+
+#[test]
+fn txn_discard_is_invisible() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    seed(db);
+
+    let txn = begin(db, false);
+    assert_eq!(txn_set(txn, b"f", b"vf"), OK);
+    assert_eq!(unsafe { regolith_txn_discard(txn) }, OK);
+    // Discard is idempotent.
+    assert_eq!(unsafe { regolith_txn_discard(txn) }, OK);
+    // Further use reports the transaction as resolved.
+    assert_eq!(txn_set(txn, b"g", b"vg"), DISCARDED);
+    assert_eq!(txn_get(txn, b"a"), Err(DISCARDED));
+    assert_eq!(unsafe { regolith_txn_free(txn) }, OK);
+
+    assert_eq!(get(db, b"f"), Err(NOT_FOUND));
+
+    // Freeing without resolving also discards.
+    let txn = begin(db, false);
+    assert_eq!(txn_set(txn, b"h", b"vh"), OK);
+    assert_eq!(unsafe { regolith_txn_free(txn) }, OK);
+    assert_eq!(get(db, b"h"), Err(NOT_FOUND));
+
+    close(db);
+}
+
+#[test]
+fn txn_commit_after_resolution_reports_discarded() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+
+    let txn = begin(db, false);
+    assert_eq!(unsafe { regolith_txn_commit(txn) }, OK);
+    assert_eq!(unsafe { regolith_txn_commit(txn) }, DISCARDED);
+    assert_eq!(unsafe { regolith_txn_free(txn) }, OK);
+
+    close(db);
+}
+
+#[test]
+fn txn_conflict_produces_the_conflict_code() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    set(db, b"k", b"v0");
+
+    // Both begin before either commits, and both write the same key, so
+    // snapshot-isolation validation must reject the second.
+    let first = begin(db, false);
+    let second = begin(db, false);
+    assert_eq!(txn_set(first, b"k", b"v1"), OK);
+    assert_eq!(txn_set(second, b"k", b"v2"), OK);
+
+    assert_eq!(unsafe { regolith_txn_commit(first) }, OK);
+    let status = unsafe { regolith_txn_commit(second) };
+    assert_eq!(
+        status,
+        TXN_CONFLICT,
+        "expected a conflict, got {status} ({:?})",
+        last_error()
+    );
+    // The detail string is available for the Go side to surface.
+    assert!(last_error().is_some_and(|m| m.contains("conflict")));
+
+    assert_eq!(unsafe { regolith_txn_free(first) }, OK);
+    assert_eq!(unsafe { regolith_txn_free(second) }, OK);
+    assert_eq!(get(db, b"k").unwrap(), b"v1");
+
+    close(db);
+}
+
+#[test]
+fn readonly_txn_rejects_writes() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    seed(db);
+
+    let txn = begin(db, true);
+    assert_eq!(txn_set(txn, b"f", b"vf"), READ_ONLY_TXN);
+    assert_eq!(
+        unsafe { regolith_txn_delete(txn, b"a".as_ptr(), 1) },
+        READ_ONLY_TXN
+    );
+    // Reads still work.
+    assert_eq!(txn_get(txn, b"a").unwrap(), b"va");
+    let mut found: u8 = 2;
+    assert_eq!(
+        unsafe { regolith_txn_has(txn, b"a".as_ptr(), 1, &raw mut found) },
+        OK
+    );
+    assert_eq!(found, 1);
+
+    assert_eq!(unsafe { regolith_txn_commit(txn) }, OK);
+    assert_eq!(unsafe { regolith_txn_free(txn) }, OK);
+    assert_eq!(get(db, b"f"), Err(NOT_FOUND));
+
+    close(db);
+}
+
+// ---------------------------------------------------------------------
+// Iteration over a transaction
+// ---------------------------------------------------------------------
+
+#[test]
+fn txn_iterator_merges_buffered_writes() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    seed(db);
+
+    let txn = begin(db, false);
+    // An insert, an overwrite and a delete, all uncommitted.
+    assert_eq!(txn_set(txn, b"bb", b"vbb"), OK);
+    assert_eq!(txn_set(txn, b"c", b"vc2"), OK);
+    assert_eq!(unsafe { regolith_txn_delete(txn, b"d".as_ptr(), 1) }, OK);
+
+    let options = opts(None, None, None, false, false);
+    let it = txn_iter(txn, &options);
+    let entries = drain(it);
+    assert_eq!(keys(&entries), ["a", "b", "bb", "c", "e"]);
+    assert_eq!(entries[3].1, "vc2");
+
+    // Reset re-walks the same merged view.
+    assert_eq!(unsafe { regolith_iter_reset(it) }, OK);
+    assert_eq!(keys(&drain(it)), ["a", "b", "bb", "c", "e"]);
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    // Reverse.
+    let options = opts(None, None, None, true, false);
+    let it = txn_iter(txn, &options);
+    assert_eq!(keys(&drain(it)), ["e", "c", "bb", "b", "a"]);
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    // Bounds, with `end` exclusive.
+    let options = opts(None, Some(b"b"), Some(b"c"), false, false);
+    let it = txn_iter(txn, &options);
+    assert_eq!(keys(&drain(it)), ["b", "bb"]);
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    // Prefix.
+    let options = opts(Some(b"b"), None, None, false, false);
+    let it = txn_iter(txn, &options);
+    assert_eq!(keys(&drain(it)), ["b", "bb"]);
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    // Seek, forward and reverse, including the range clamp.
+    let options = opts(None, Some(b"b"), Some(b"e"), false, false);
+    let it = txn_iter(txn, &options);
+    assert!(iter_seek(it, b"ba"));
+    assert_eq!(iter_key(it), b"bb");
+    assert!(iter_next(it));
+    assert_eq!(iter_key(it), b"c");
+    assert!(iter_seek(it, b"a"));
+    assert_eq!(iter_key(it), b"b", "seek below start must clamp to start");
+    assert!(!iter_seek(it, b"e"));
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    let options = opts(None, Some(b"b"), Some(b"e"), true, false);
+    let it = txn_iter(txn, &options);
+    assert!(iter_seek(it, b"bb"));
+    assert_eq!(iter_key(it), b"bb", "reverse seek must include the target");
+    assert!(iter_next(it));
+    assert_eq!(iter_key(it), b"b");
+    assert!(iter_seek(it, b"zzz"));
+    assert_eq!(iter_key(it), b"c", "seek above end must clamp to the range");
+    assert!(!iter_seek(it, b"a"));
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    assert_eq!(unsafe { regolith_txn_discard(txn) }, OK);
+    assert_eq!(unsafe { regolith_txn_free(txn) }, OK);
+    close(db);
+}
+
+#[test]
+fn txn_iterator_on_a_resolved_txn_is_rejected() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    seed(db);
+
+    let txn = begin(db, false);
+    assert_eq!(unsafe { regolith_txn_discard(txn) }, OK);
+
+    let options = opts(None, None, None, false, false);
+    let mut it: *mut RegolithIter = ptr::null_mut();
+    assert_eq!(
+        unsafe { regolith_txn_iter(txn, &raw const options, &raw mut it) },
+        DISCARDED
+    );
+    assert_eq!(unsafe { regolith_txn_free(txn) }, OK);
+
+    close(db);
+}
+
+#[test]
+fn null_iter_options_means_full_forward_iteration() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    seed(db);
+
+    let mut it: *mut RegolithIter = ptr::null_mut();
+    assert_eq!(
+        unsafe { regolith_db_iter(db, ptr::null(), &raw mut it) },
+        OK
+    );
+    assert_eq!(keys(&drain(it)), ["a", "b", "c", "d", "e"]);
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    close(db);
+}
