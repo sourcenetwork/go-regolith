@@ -85,6 +85,9 @@ func TestOpenWithEachFieldProducesAWorkingStore(t *testing.T) {
 		"CompressionLZ4":           {Compression: CompressionLZ4},
 		"DurabilityImmediate":      {Durability: DurabilityImmediate},
 		"DurabilityEventual":       {Durability: DurabilityEventual},
+		"IsolationReadCommitted":   {Isolation: IsolationReadCommitted},
+		"IsolationSnapshot":        {Isolation: IsolationSnapshot},
+		"IsolationSerializable":    {Isolation: IsolationSerializable},
 		"Everything": {
 			WriteBufferSize:          Uint64(4 << 20),
 			BlockCacheSize:           Uint64(8 << 20),
@@ -92,6 +95,7 @@ func TestOpenWithEachFieldProducesAWorkingStore(t *testing.T) {
 			TransactionKeysInline:    Uint64(8),
 			Compression:              CompressionSnappy,
 			Durability:               DurabilityEventual,
+			Isolation:                IsolationSerializable,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -132,6 +136,10 @@ func TestOptionsPresenceMaskTracksWhatWasSet(t *testing.T) {
 			Options{Durability: DurabilityImmediate},
 			optDurability,
 		},
+		"Isolation": {
+			Options{Isolation: IsolationSerializable},
+			optIsolation,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			cOpts, err := test.opts.toC()
@@ -165,6 +173,7 @@ func TestOpenWithRejectsAnUnknownEnumValue(t *testing.T) {
 	}{
 		"Compression": {Options{Compression: Compression(99)}, "Compression"},
 		"Durability":  {Options{Durability: Durability(99)}, "Durability"},
+		"Isolation":   {Options{Isolation: Isolation(99)}, "Isolation"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := OpenWith(t.TempDir(), test.opts)
@@ -199,5 +208,111 @@ func TestOpenWithNoBackgroundCompactionsStillFlushes(t *testing.T) {
 	}
 	if got, err := db.Get([]byte{'k', 0}); err != nil || len(got) != len(value) {
 		t.Fatalf("get: got %d bytes, %v", len(got), err)
+	}
+}
+
+// writeSkew runs the write-skew schedule against a store opened with the given
+// options and returns the error from the second commit, which is the whole
+// question: the first always commits, so whether the second one does is exactly
+// what the isolation level decides.
+//
+// Two transactions, each reading the key the other is about to write, with
+// disjoint write sets.  No serial order produces that schedule, but only
+// serializable validation has a read set big enough to notice.
+func writeSkew(t *testing.T, opts Options) error {
+	t.Helper()
+
+	db := openWith(t, opts)
+	for _, key := range []string{"x", "y"} {
+		if err := db.Set([]byte(key), []byte("0")); err != nil {
+			t.Fatalf("seed %s: %v", key, err)
+		}
+	}
+
+	first, err := db.NewTxn(false)
+	if err != nil {
+		t.Fatalf("first txn: %v", err)
+	}
+	defer first.Discard()
+	second, err := db.NewTxn(false)
+	if err != nil {
+		t.Fatalf("second txn: %v", err)
+	}
+	defer second.Discard()
+
+	// Plain reads: nothing asks for a key "for update", so snapshot isolation
+	// validates neither of them.
+	if value, err := first.Get([]byte("y")); err != nil || string(value) != "0" {
+		t.Fatalf("first read: got %q, %v", value, err)
+	}
+	if value, err := second.Get([]byte("x")); err != nil || string(value) != "0" {
+		t.Fatalf("second read: got %q, %v", value, err)
+	}
+	if err := first.Set([]byte("x"), []byte("1")); err != nil {
+		t.Fatalf("first set: %v", err)
+	}
+	if err := second.Set([]byte("y"), []byte("1")); err != nil {
+		t.Fatalf("second set: %v", err)
+	}
+
+	if err := first.Commit(); err != nil {
+		t.Fatalf("first commit: %v", err)
+	}
+	return second.Commit()
+}
+
+func TestIsolationDecidesWhetherWriteSkewCommits(t *testing.T) {
+	for name, test := range map[string]struct {
+		opts    Options
+		conflic bool
+	}{
+		// Unset is the engine default, so the behaviour predates this option.
+		"Unset":         {Options{}, false},
+		"ReadCommitted": {Options{Isolation: IsolationReadCommitted}, false},
+		"Snapshot":      {Options{Isolation: IsolationSnapshot}, false},
+		"Serializable":  {Options{Isolation: IsolationSerializable}, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := writeSkew(t, test.opts)
+			switch {
+			case test.conflic && !errors.Is(err, ErrConflict):
+				t.Errorf("second commit: got %v, want a conflict", err)
+			case !test.conflic && err != nil:
+				t.Errorf("second commit: got %v, want it to commit", err)
+			}
+		})
+	}
+}
+
+func TestSerializableStillConflictsOnAWriteWriteOverlap(t *testing.T) {
+	// Serializable only ever adds to the validation set, so everything snapshot
+	// isolation rejected it has to reject too.
+	db := openWith(t, Options{Isolation: IsolationSerializable})
+	if err := db.Set([]byte("k"), []byte("v0")); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+
+	first, err := db.NewTxn(false)
+	if err != nil {
+		t.Fatalf("first txn: %v", err)
+	}
+	defer first.Discard()
+	second, err := db.NewTxn(false)
+	if err != nil {
+		t.Fatalf("second txn: %v", err)
+	}
+	defer second.Discard()
+
+	if err := first.Set([]byte("k"), []byte("v1")); err != nil {
+		t.Fatalf("first set: %v", err)
+	}
+	if err := second.Set([]byte("k"), []byte("v2")); err != nil {
+		t.Fatalf("second set: %v", err)
+	}
+	if err := first.Commit(); err != nil {
+		t.Fatalf("first commit: %v", err)
+	}
+	if err := second.Commit(); !errors.Is(err, ErrConflict) {
+		t.Errorf("second commit: got %v, want a conflict", err)
 	}
 }

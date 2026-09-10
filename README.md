@@ -122,6 +122,11 @@ db, err := regolith.OpenWith("/tmp/my-store", regolith.Options{
 	// on the calling thread.
 	MaxBackgroundCompactions: regolith.Uint64(0),
 	Durability:               regolith.DurabilityImmediate,
+	// Validate every key a transaction read, not only the ones it wrote, so
+	// write skew aborts instead of committing.  Applies to every transaction the
+	// store begins: corekv's `NewTxn(readonly bool)` leaves no room for a
+	// per-transaction level.
+	Isolation: regolith.IsolationSerializable,
 })
 ```
 
@@ -164,7 +169,8 @@ detail string the FFI layer records.
 - The build requirement above.
 - Only a small subset of regolith's engine `Options` crosses the FFI so far:
   `WriteBufferSize`, `BlockCacheSize`, `MaxBackgroundCompactions`,
-  `TransactionKeysInline`, `Compression` and `Durability`. The rest of that type
+  `TransactionKeysInline`, `Compression`, `Durability` and `Isolation`. The rest
+  of that type
   is mostly trait-object hooks (compaction filters, merge operators, event
   listeners, a pluggable `Env`) with no C representation.
 

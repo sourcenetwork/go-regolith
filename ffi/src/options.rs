@@ -22,6 +22,14 @@
 //! check, no per-field flag to forget, and adding a field later is a new
 //! bit constant plus one line in [`options_from`].
 //!
+//! # Not every field is an engine option
+//!
+//! `isolation` is not a field of regolith's [`Options`] at all: the
+//! level lives on the transaction database, which is what hands it to
+//! each transaction it begins. [`options_from`] therefore resolves into
+//! a [`ResolvedOptions`] pair - the engine options, plus the things the
+//! store handle has to carry itself - rather than into an [`Options`].
+//!
 //! # Validation
 //!
 //! Only the things regolith cannot see are checked here: an unknown enum
@@ -30,7 +38,7 @@
 //! runs at open and its error names the offending field - so they are
 //! mapped through rather than duplicated.
 
-use regolith::{CompressionType, DurabilityMode, Options};
+use regolith::{CompressionType, DurabilityMode, IsolationLevel, Options};
 
 use crate::{INVALID_ARG, set_error};
 
@@ -50,6 +58,8 @@ pub const OPT_TRANSACTION_KEYS_INLINE: u64 = 1 << 3;
 pub const OPT_COMPRESSION: u64 = 1 << 4;
 /// `durability` is set.
 pub const OPT_DURABILITY: u64 = 1 << 5;
+/// `isolation` is set.
+pub const OPT_ISOLATION: u64 = 1 << 6;
 
 /// Every bit this version understands. An unknown bit is rejected, so a
 /// caller built against a newer header cannot silently get a default.
@@ -58,7 +68,8 @@ const OPT_KNOWN: u64 = OPT_WRITE_BUFFER_SIZE
     | OPT_MAX_BACKGROUND_COMPACTIONS
     | OPT_TRANSACTION_KEYS_INLINE
     | OPT_COMPRESSION
-    | OPT_DURABILITY;
+    | OPT_DURABILITY
+    | OPT_ISOLATION;
 
 // ---------------------------------------------------------------------
 // Enum discriminants. Kept numerically identical to the header.
@@ -75,6 +86,13 @@ pub const COMPRESSION_LZ4: u32 = 2;
 pub const DURABILITY_IMMEDIATE: u32 = 0;
 /// Let the OS flush eventually (regolith's default).
 pub const DURABILITY_EVENTUAL: u32 = 1;
+
+/// Validate only what the transaction wrote.
+pub const ISOLATION_READ_COMMITTED: u32 = 0;
+/// Validate writes and keys read for update (regolith's default).
+pub const ISOLATION_SNAPSHOT: u32 = 1;
+/// Validate the transaction's entire read set.
+pub const ISOLATION_SERIALIZABLE: u32 = 2;
 
 /// Engine options, laid out for C.
 ///
@@ -99,6 +117,21 @@ pub struct RegolithOptions {
     pub compression: u32,
     /// One of the `DURABILITY_*` constants. Engine default: Eventual.
     pub durability: u32,
+    /// One of the `ISOLATION_*` constants, used by every transaction the
+    /// store begins. Engine default: snapshot isolation.
+    pub isolation: u32,
+}
+
+/// What a caller's options resolve into: the engine's own [`Options`],
+/// plus the settings the store handle has to carry because regolith does
+/// not keep them on [`Options`].
+#[derive(Debug, Default)]
+pub(crate) struct ResolvedOptions {
+    /// Passed to `OptimisticTransactionDb::open`.
+    pub engine: Options,
+    /// Applied with `OptimisticTransactionDb::with_isolation`, and used
+    /// by every transaction that store begins.
+    pub isolation: IsolationLevel,
 }
 
 /// Narrow a C `u64` to a `usize`, naming the field if it does not fit.
@@ -114,15 +147,15 @@ fn as_usize(name: &str, value: u64) -> Result<usize, i32> {
     })
 }
 
-/// Resolve a caller-supplied options struct onto a default [`Options`].
-/// A null `opts`, or one with `present == 0`, yields exactly
-/// `Options::default()`.
+/// Resolve a caller-supplied options struct onto the engine defaults. A
+/// null `opts`, or one with `present == 0`, yields exactly
+/// `ResolvedOptions::default()`.
 ///
 /// # Safety
 /// `opts` must be null or point at a valid [`RegolithOptions`] for the
 /// duration of the call. Nothing is retained past it.
-pub(crate) unsafe fn options_from(opts: *const RegolithOptions) -> Result<Options, i32> {
-    let mut resolved = Options::default();
+pub(crate) unsafe fn options_from(opts: *const RegolithOptions) -> Result<ResolvedOptions, i32> {
+    let mut resolved = ResolvedOptions::default();
     let Some(opts) = (unsafe { opts.as_ref() }) else {
         return Ok(resolved);
     };
@@ -136,21 +169,23 @@ pub(crate) unsafe fn options_from(opts: *const RegolithOptions) -> Result<Option
     }
 
     if opts.present & OPT_WRITE_BUFFER_SIZE != 0 {
-        resolved.write_buffer_size = as_usize("write_buffer_size", opts.write_buffer_size)?;
+        resolved.engine.write_buffer_size = as_usize("write_buffer_size", opts.write_buffer_size)?;
     }
     if opts.present & OPT_BLOCK_CACHE_SIZE != 0 {
-        resolved.block_cache_size = as_usize("block_cache_size", opts.block_cache_size)?;
+        resolved.engine.block_cache_size = as_usize("block_cache_size", opts.block_cache_size)?;
     }
     if opts.present & OPT_MAX_BACKGROUND_COMPACTIONS != 0 {
-        resolved.max_background_compactions =
-            as_usize("max_background_compactions", opts.max_background_compactions)?;
+        resolved.engine.max_background_compactions = as_usize(
+            "max_background_compactions",
+            opts.max_background_compactions,
+        )?;
     }
     if opts.present & OPT_TRANSACTION_KEYS_INLINE != 0 {
-        resolved.transaction_keys_inline =
+        resolved.engine.transaction_keys_inline =
             as_usize("transaction_keys_inline", opts.transaction_keys_inline)?;
     }
     if opts.present & OPT_COMPRESSION != 0 {
-        resolved.compression = match opts.compression {
+        resolved.engine.compression = match opts.compression {
             COMPRESSION_NONE => CompressionType::None,
             COMPRESSION_SNAPPY => CompressionType::Snappy,
             COMPRESSION_LZ4 => CompressionType::Lz4,
@@ -163,12 +198,25 @@ pub(crate) unsafe fn options_from(opts: *const RegolithOptions) -> Result<Option
         };
     }
     if opts.present & OPT_DURABILITY != 0 {
-        resolved.durability = match opts.durability {
+        resolved.engine.durability = match opts.durability {
             DURABILITY_IMMEDIATE => DurabilityMode::Immediate,
             DURABILITY_EVENTUAL => DurabilityMode::Eventual,
             other => {
                 set_error(format!(
                     "invalid option `durability`: unknown mode {other}"
+                ));
+                return Err(INVALID_ARG);
+            }
+        };
+    }
+    if opts.present & OPT_ISOLATION != 0 {
+        resolved.isolation = match opts.isolation {
+            ISOLATION_READ_COMMITTED => IsolationLevel::ReadCommitted,
+            ISOLATION_SNAPSHOT => IsolationLevel::SnapshotIsolation,
+            ISOLATION_SERIALIZABLE => IsolationLevel::Serializable,
+            other => {
+                set_error(format!(
+                    "invalid option `isolation`: unknown level {other}"
                 ));
                 return Err(INVALID_ARG);
             }
@@ -192,32 +240,37 @@ mod tests {
             transaction_keys_inline: 0,
             compression: 0,
             durability: 0,
+            isolation: 0,
         }
     }
 
-    fn resolve(opts: &RegolithOptions) -> Result<Options, i32> {
+    fn resolve(opts: &RegolithOptions) -> Result<ResolvedOptions, i32> {
         unsafe { options_from(opts) }
     }
 
     /// Every field this module can touch, compared against a reference.
     /// A new exposed field gets a line here and the rest of the tests
     /// keep working.
-    fn assert_same_as(got: &Options, want: &Options) {
-        assert_eq!(got.write_buffer_size, want.write_buffer_size);
-        assert_eq!(got.block_cache_size, want.block_cache_size);
+    fn assert_same_as(got: &ResolvedOptions, want: &ResolvedOptions) {
+        assert_eq!(got.engine.write_buffer_size, want.engine.write_buffer_size);
+        assert_eq!(got.engine.block_cache_size, want.engine.block_cache_size);
         assert_eq!(
-            got.max_background_compactions,
-            want.max_background_compactions
+            got.engine.max_background_compactions,
+            want.engine.max_background_compactions
         );
-        assert_eq!(got.transaction_keys_inline, want.transaction_keys_inline);
-        assert_eq!(got.compression, want.compression);
-        assert_eq!(got.durability, want.durability);
+        assert_eq!(
+            got.engine.transaction_keys_inline,
+            want.engine.transaction_keys_inline
+        );
+        assert_eq!(got.engine.compression, want.engine.compression);
+        assert_eq!(got.engine.durability, want.engine.durability);
+        assert_eq!(got.isolation, want.isolation);
     }
 
     #[test]
     fn null_means_defaults() {
         let resolved = unsafe { options_from(std::ptr::null()) }.unwrap();
-        assert_same_as(&resolved, &Options::default());
+        assert_same_as(&resolved, &ResolvedOptions::default());
     }
 
     #[test]
@@ -226,7 +279,10 @@ mod tests {
         // set `block_cache_size = 0` (cache disabled) or
         // `max_background_compactions = 0` (no worker).
         let resolved = resolve(&empty()).unwrap();
-        assert_same_as(&resolved, &Options::default());
+        assert_same_as(&resolved, &ResolvedOptions::default());
+        // regolith's own default, so every benchmark number recorded
+        // before this field existed still describes the same engine.
+        assert_eq!(resolved.isolation, IsolationLevel::SnapshotIsolation);
     }
 
     #[test]
@@ -238,37 +294,53 @@ mod tests {
         opts.transaction_keys_inline = 128;
         opts.compression = COMPRESSION_NONE;
         opts.durability = DURABILITY_IMMEDIATE;
+        opts.isolation = ISOLATION_SERIALIZABLE;
 
         // Values present, no bits: still every default.
-        assert_same_as(&resolve(&opts).unwrap(), &Options::default());
+        assert_same_as(&resolve(&opts).unwrap(), &ResolvedOptions::default());
 
         // One bit at a time: that field moves, the others do not.
         let defaults = Options::default();
 
         opts.present = OPT_WRITE_BUFFER_SIZE;
         let resolved = resolve(&opts).unwrap();
-        assert_eq!(resolved.write_buffer_size, 8 * 1024 * 1024);
-        assert_eq!(resolved.block_cache_size, defaults.block_cache_size);
-        assert_eq!(resolved.compression, defaults.compression);
+        assert_eq!(resolved.engine.write_buffer_size, 8 * 1024 * 1024);
+        assert_eq!(resolved.engine.block_cache_size, defaults.block_cache_size);
+        assert_eq!(resolved.engine.compression, defaults.compression);
+        assert_eq!(resolved.isolation, IsolationLevel::default());
 
         opts.present = OPT_BLOCK_CACHE_SIZE;
         let resolved = resolve(&opts).unwrap();
-        assert_eq!(resolved.block_cache_size, 4 * 1024 * 1024);
-        assert_eq!(resolved.write_buffer_size, defaults.write_buffer_size);
+        assert_eq!(resolved.engine.block_cache_size, 4 * 1024 * 1024);
+        assert_eq!(
+            resolved.engine.write_buffer_size,
+            defaults.write_buffer_size
+        );
 
         opts.present = OPT_MAX_BACKGROUND_COMPACTIONS;
-        assert_eq!(resolve(&opts).unwrap().max_background_compactions, 2);
+        assert_eq!(resolve(&opts).unwrap().engine.max_background_compactions, 2);
 
         opts.present = OPT_TRANSACTION_KEYS_INLINE;
-        assert_eq!(resolve(&opts).unwrap().transaction_keys_inline, 128);
+        assert_eq!(resolve(&opts).unwrap().engine.transaction_keys_inline, 128);
 
         opts.present = OPT_COMPRESSION;
-        assert_eq!(resolve(&opts).unwrap().compression, CompressionType::None);
+        assert_eq!(
+            resolve(&opts).unwrap().engine.compression,
+            CompressionType::None
+        );
 
         opts.present = OPT_DURABILITY;
         assert_eq!(
-            resolve(&opts).unwrap().durability,
+            resolve(&opts).unwrap().engine.durability,
             DurabilityMode::Immediate
+        );
+
+        opts.present = OPT_ISOLATION;
+        let resolved = resolve(&opts).unwrap();
+        assert_eq!(resolved.isolation, IsolationLevel::Serializable);
+        assert_eq!(
+            resolved.engine.write_buffer_size,
+            defaults.write_buffer_size
         );
     }
 
@@ -281,19 +353,19 @@ mod tests {
         assert_ne!(defaults.max_background_compactions, 0);
         let mut opts = empty();
         opts.present = OPT_MAX_BACKGROUND_COMPACTIONS;
-        assert_eq!(resolve(&opts).unwrap().max_background_compactions, 0);
+        assert_eq!(resolve(&opts).unwrap().engine.max_background_compactions, 0);
 
         // block_cache_size: 0 disables the cache.
         assert_ne!(defaults.block_cache_size, 0);
         let mut opts = empty();
         opts.present = OPT_BLOCK_CACHE_SIZE;
-        assert_eq!(resolve(&opts).unwrap().block_cache_size, 0);
+        assert_eq!(resolve(&opts).unwrap().engine.block_cache_size, 0);
 
         // transaction_keys_inline: 0 never indexes.
         assert_ne!(defaults.transaction_keys_inline, 0);
         let mut opts = empty();
         opts.present = OPT_TRANSACTION_KEYS_INLINE;
-        assert_eq!(resolve(&opts).unwrap().transaction_keys_inline, 0);
+        assert_eq!(resolve(&opts).unwrap().engine.transaction_keys_inline, 0);
     }
 
     #[test]
@@ -306,7 +378,21 @@ mod tests {
             let mut opts = empty();
             opts.present = OPT_COMPRESSION;
             opts.compression = discriminant;
-            assert_eq!(resolve(&opts).unwrap().compression, want);
+            assert_eq!(resolve(&opts).unwrap().engine.compression, want);
+        }
+    }
+
+    #[test]
+    fn every_isolation_level_maps() {
+        for (discriminant, want) in [
+            (ISOLATION_READ_COMMITTED, IsolationLevel::ReadCommitted),
+            (ISOLATION_SNAPSHOT, IsolationLevel::SnapshotIsolation),
+            (ISOLATION_SERIALIZABLE, IsolationLevel::Serializable),
+        ] {
+            let mut opts = empty();
+            opts.present = OPT_ISOLATION;
+            opts.isolation = discriminant;
+            assert_eq!(resolve(&opts).unwrap().isolation, want);
         }
     }
 
@@ -323,6 +409,12 @@ mod tests {
         opts.durability = 7;
         assert_eq!(resolve(&opts).unwrap_err(), INVALID_ARG);
         assert!(crate::tests::last_error().unwrap().contains("durability"));
+
+        let mut opts = empty();
+        opts.present = OPT_ISOLATION;
+        opts.isolation = 3;
+        assert_eq!(resolve(&opts).unwrap_err(), INVALID_ARG);
+        assert!(crate::tests::last_error().unwrap().contains("isolation"));
     }
 
     #[test]

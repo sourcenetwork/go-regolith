@@ -1450,6 +1450,7 @@ fn no_options() -> RegolithOptions {
         transaction_keys_inline: 0,
         compression: 0,
         durability: 0,
+        isolation: 0,
     }
 }
 
@@ -1603,6 +1604,129 @@ fn an_unknown_enum_discriminant_is_rejected_with_the_field_named() {
     let message = last_error().expect("a detail message");
     assert!(
         message.contains("compression"),
+        "message does not name the field: {message}"
+    );
+}
+
+/// Two transactions that each read what the other is about to write, with
+/// disjoint write sets: the write-skew schedule. Returns the status of
+/// the second commit, which is the whole question - the first always
+/// commits, so whether the second one does is exactly what the isolation
+/// level decides.
+fn write_skew(dir: &TempDir, opts: *const RegolithOptions) -> i32 {
+    let db = open_with(dir, opts).expect("open failed");
+    set(db, b"x", b"0");
+    set(db, b"y", b"0");
+
+    let first = begin(db, false);
+    let second = begin(db, false);
+
+    // Each reads the key the other writes. Plain reads: nothing here asks
+    // for a key "for update", so snapshot isolation validates neither.
+    assert_eq!(txn_get(first, b"y").unwrap(), b"0");
+    assert_eq!(txn_get(second, b"x").unwrap(), b"0");
+    assert_eq!(txn_set(first, b"x", b"1"), OK);
+    assert_eq!(txn_set(second, b"y", b"1"), OK);
+
+    assert_eq!(
+        unsafe { regolith_txn_commit(first) },
+        OK,
+        "first commit: {:?}",
+        last_error()
+    );
+    let status = unsafe { regolith_txn_commit(second) };
+
+    assert_eq!(unsafe { regolith_txn_free(first) }, OK);
+    assert_eq!(unsafe { regolith_txn_free(second) }, OK);
+    close(db);
+    status
+}
+
+#[test]
+fn isolation_unset_is_snapshot_isolation_and_admits_write_skew() {
+    // The guarantee that keeps every previously recorded number valid: a
+    // store opened without the bit behaves exactly as it did before the
+    // field existed.
+    let dir = TempDir::new().unwrap();
+    assert_eq!(write_skew(&dir, ptr::null()), OK);
+
+    let dir = TempDir::new().unwrap();
+    let opts = no_options();
+    assert_eq!(write_skew(&dir, &raw const opts), OK);
+}
+
+#[test]
+fn each_isolation_level_changes_what_write_skew_does() {
+    for (level, label, want) in [
+        (ISOLATION_READ_COMMITTED, "read committed", OK),
+        (ISOLATION_SNAPSHOT, "snapshot", OK),
+        (ISOLATION_SERIALIZABLE, "serializable", TXN_CONFLICT),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let mut opts = no_options();
+        opts.present = OPT_ISOLATION;
+        opts.isolation = level;
+
+        let status = write_skew(&dir, &raw const opts);
+        assert_eq!(
+            status,
+            want,
+            "{label}: second commit was {status}, want {want} ({:?})",
+            last_error()
+        );
+    }
+}
+
+#[test]
+fn serializable_still_conflicts_on_a_write_write_overlap() {
+    // Serializable only ever adds to the validation set, so everything
+    // snapshot isolation rejected it must reject too.
+    let dir = TempDir::new().unwrap();
+    let mut opts = no_options();
+    opts.present = OPT_ISOLATION;
+    opts.isolation = ISOLATION_SERIALIZABLE;
+    let db = open_with(&dir, &raw const opts).expect("open failed");
+    set(db, b"k", b"v0");
+
+    let first = begin(db, false);
+    let second = begin(db, false);
+    assert_eq!(txn_set(first, b"k", b"v1"), OK);
+    assert_eq!(txn_set(second, b"k", b"v2"), OK);
+    assert_eq!(unsafe { regolith_txn_commit(first) }, OK);
+    assert_eq!(unsafe { regolith_txn_commit(second) }, TXN_CONFLICT);
+    assert_eq!(unsafe { regolith_txn_free(first) }, OK);
+    assert_eq!(unsafe { regolith_txn_free(second) }, OK);
+    assert_eq!(get(db, b"k").unwrap(), b"v1");
+
+    close(db);
+}
+
+#[test]
+fn every_isolation_level_round_trips_into_a_working_store() {
+    for level in [
+        ISOLATION_READ_COMMITTED,
+        ISOLATION_SNAPSHOT,
+        ISOLATION_SERIALIZABLE,
+    ] {
+        let dir = TempDir::new().unwrap();
+        let mut opts = no_options();
+        opts.present = OPT_ISOLATION;
+        opts.isolation = level;
+        assert_store_works(&dir, &opts, &format!("isolation {level}"));
+    }
+}
+
+#[test]
+fn an_unknown_isolation_level_is_rejected_with_the_field_named() {
+    let dir = TempDir::new().unwrap();
+    let mut opts = no_options();
+    opts.present = OPT_ISOLATION;
+    opts.isolation = 3;
+
+    assert_eq!(open_with(&dir, &raw const opts), Err(INVALID_ARG));
+    let message = last_error().expect("a detail message");
+    assert!(
+        message.contains("isolation"),
         "message does not name the field: {message}"
     );
 }

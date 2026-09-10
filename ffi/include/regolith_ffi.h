@@ -205,6 +205,20 @@ typedef struct RegolithIterOptions {
  *                                 values. Default LZ4.
  *   durability                  - one of the REGOLITH_DURABILITY_*
  *                                 values. Default Eventual.
+ *   isolation                   - one of the REGOLITH_ISOLATION_*
+ *                                 values, used by every transaction the
+ *                                 store begins. Default snapshot
+ *                                 isolation.
+ *
+ * `isolation` is the one field that is not an engine option: regolith
+ * keeps the level on the transaction database rather than on its
+ * Options, so it is applied to the store handle at open and read back
+ * from it by regolith_db_txn. Leaving the bit unset therefore keeps the
+ * behaviour this ABI has always had - snapshot isolation, aborting on a
+ * write-write overlap and admitting write skew. REGOLITH_ISOLATION_
+ * SERIALIZABLE additionally validates every key the transaction read, so
+ * write skew aborts too, at the cost of a read-set-sized check on the
+ * transaction that commits second.
  *
  * Invalid values are rejected, never clamped, and the detail message
  * names the offending field. An unknown enum value or presence bit is
@@ -225,6 +239,7 @@ typedef struct RegolithIterOptions {
 #define REGOLITH_OPT_TRANSACTION_KEYS_INLINE (1ULL << 3)
 #define REGOLITH_OPT_COMPRESSION (1ULL << 4)
 #define REGOLITH_OPT_DURABILITY (1ULL << 5)
+#define REGOLITH_OPT_ISOLATION (1ULL << 6)
 
 /* Values for RegolithOptions.compression. */
 #define REGOLITH_COMPRESSION_NONE 0
@@ -235,6 +250,13 @@ typedef struct RegolithIterOptions {
 #define REGOLITH_DURABILITY_IMMEDIATE 0
 #define REGOLITH_DURABILITY_EVENTUAL 1
 
+/* Values for RegolithOptions.isolation. What each level validates at
+ * commit: only what the transaction wrote; that plus keys read for
+ * update (regolith's default); or the entire read set. */
+#define REGOLITH_ISOLATION_READ_COMMITTED 0
+#define REGOLITH_ISOLATION_SNAPSHOT 1
+#define REGOLITH_ISOLATION_SERIALIZABLE 2
+
 typedef struct RegolithOptions {
   uint64_t present;
   uint64_t write_buffer_size;
@@ -243,6 +265,7 @@ typedef struct RegolithOptions {
   uint64_t transaction_keys_inline;
   uint32_t compression;
   uint32_t durability;
+  uint32_t isolation;
 } RegolithOptions;
 
 /* --------------------------------------------------------------------
@@ -327,7 +350,9 @@ int32_t regolith_db_drop_all(RegolithDb *db);
 int32_t regolith_db_iter(RegolithDb *db, const RegolithIterOptions *opts,
                          RegolithIter **out);
 
-/* Begin a transaction (optimistic, snapshot isolation). Pass readonly
+/* Begin an optimistic transaction at the store's configured isolation
+ * level - the one RegolithOptions.isolation selected at open, which is
+ * snapshot isolation when it was left unset. Pass readonly
  * non-zero to have regolith_txn_set/delete return
  * REGOLITH_ERR_READ_ONLY_TXN; regolith itself has no read-only mode, so
  * the flag is enforced by this layer. On REGOLITH_OK, *out owns a handle

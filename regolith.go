@@ -15,8 +15,9 @@
 //
 // Open a store with [Open], read and write through [DB], iterate with
 // [DB.NewIter], and group writes with [DB.NewTxn].  Transactions are optimistic
-// with snapshot isolation, so a commit that lost a validation race returns
-// [ErrConflict] and should be retried from a new transaction.
+// with snapshot isolation by default, so a commit that lost a validation race
+// returns [ErrConflict] and should be retried from a new transaction.  A store
+// opened with [OpenWith] can choose another level; see [Options.Isolation].
 //
 // # Limitations
 //
@@ -252,9 +253,10 @@ func (db *DB) NewIter(opts IterOptions) (*Iter, error) {
 // NewTxn begins a transaction, which must be resolved with [Txn.Commit] or
 // [Txn.Discard].
 //
-// Transactions are optimistic with snapshot isolation.  regolith itself has no
-// read-only mode, so `readOnly` is enforced by the FFI layer: writes on such a
-// transaction return [ErrReadOnly].
+// Transactions are optimistic, at the isolation level the store was opened with
+// ([Options.Isolation], snapshot isolation unless it was set).  regolith itself
+// has no read-only mode, so `readOnly` is enforced by the FFI layer: writes on
+// such a transaction return [ErrReadOnly].
 func (db *DB) NewTxn(readOnly bool) (*Txn, error) {
 	db.closeLk.RLock()
 	defer db.closeLk.RUnlock()

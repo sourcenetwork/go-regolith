@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use regolith::{IsolationLevel, OptimisticTransactionDb};
+use regolith::OptimisticTransactionDb;
 
 use crate::iter::{RegolithIter, RegolithIterOptions};
 use crate::options::{RegolithOptions, options_from};
@@ -20,6 +20,10 @@ use crate::{
 /// and there is no second open path to keep consistent. Optimistic +
 /// snapshot isolation is the closest match to badger's semantics, which
 /// is what the corekv test suite expects.
+///
+/// The isolation level is held by the `OptimisticTransactionDb` itself
+/// (`with_isolation` at open), not by a field here, so there is only one
+/// place for [`regolith_db_txn`] to read it from.
 pub struct RegolithDb {
     /// `Arc` because `begin_transaction_owned` takes `&Arc<Self>`.
     pub(crate) inner: Arc<OptimisticTransactionDb>,
@@ -93,7 +97,9 @@ pub unsafe extern "C" fn regolith_db_open_with_options(
             Ok(options) => options,
             Err(status) => return status,
         };
-        match OptimisticTransactionDb::open(path, options) {
+        match OptimisticTransactionDb::open(path, options.engine)
+            .map(|db| db.with_isolation(options.isolation))
+        {
             Ok(db) => {
                 let handle = Box::new(RegolithDb {
                     inner: Arc::new(db),
@@ -285,9 +291,13 @@ pub unsafe extern "C" fn regolith_db_iter(
     })
 }
 
-/// Begin a transaction. `readonly` is enforced by this layer: regolith
-/// has no read-only transaction mode, so the flag is carried on the
-/// handle and writes are rejected with `REGOLITH_ERR_READ_ONLY_TXN`.
+/// Begin a transaction at the store's configured isolation level - the
+/// one `isolation` in [`RegolithOptions`] selected at open, which is
+/// regolith's own default when it was left unset.
+///
+/// `readonly` is enforced by this layer: regolith has no read-only
+/// transaction mode, so the flag is carried on the handle and writes are
+/// rejected with `REGOLITH_ERR_READ_ONLY_TXN`.
 ///
 /// # Safety
 /// `db` must be live; `out` must be writable.
@@ -305,7 +315,7 @@ pub unsafe extern "C" fn regolith_db_txn(
         }
         let owned = handle
             .inner
-            .begin_transaction_owned(IsolationLevel::SnapshotIsolation);
+            .begin_transaction_owned(handle.inner.isolation());
         let txn = RegolithTxn {
             inner: Arc::new(TxnInner::new(owned, readonly != 0)),
         };

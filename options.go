@@ -54,6 +54,12 @@ type Options struct {
 	// Durability is when a write is flushed to disk.  Engine default:
 	// [DurabilityEventual].
 	Durability Durability
+
+	// Isolation is the isolation level of every transaction the store begins.
+	// It is a store-level setting rather than a per-transaction one because
+	// that is all corekv's `NewTxn(readonly bool)` leaves room for.  Engine
+	// default: [IsolationSnapshot].
+	Isolation Isolation
 }
 
 // Compression is a block compression codec for SSTable data blocks.
@@ -95,6 +101,38 @@ const (
 	DurabilityEventual
 )
 
+// Isolation is how much a transaction is protected against concurrent commits,
+// which is to say how much of it is validated at commit time.
+type Isolation uint32
+
+const (
+	// IsolationDefault leaves the level at the engine default (snapshot
+	// isolation).  It is the zero value, so an [Options] that says nothing about
+	// isolation gets it, and a store opened that way behaves exactly as it did
+	// before this option existed.
+	IsolationDefault Isolation = iota
+
+	// IsolationReadCommitted validates only the keys the transaction wrote.  A
+	// key it merely read is never checked.
+	IsolationReadCommitted
+
+	// IsolationSnapshot is the engine default: it validates what the transaction
+	// wrote, which is what prevents a lost update.  A plain read is still
+	// unvalidated, so two transactions can each read what the other overwrites,
+	// write disjoint keys, and both commit - write skew.
+	IsolationSnapshot
+
+	// IsolationSerializable validates every key the transaction read as well, so
+	// a concurrent commit to any of them aborts it and write skew is
+	// unreachable.  The cost is paid by the transaction committing second and is
+	// proportional to its read set.
+	//
+	// This covers point reads, which is all a transaction here can do: there is
+	// no transactional range scan, so a read set is a set of keys rather than a
+	// predicate.
+	IsolationSerializable
+)
+
 // Presence bits for the C options struct, mirroring the REGOLITH_OPT_* macros
 // in the header.  Named here rather than used inline so the mapping is visible
 // from Go and testable without cgo.
@@ -105,6 +143,7 @@ const (
 	optTransactionKeysInline    = uint64(C.REGOLITH_OPT_TRANSACTION_KEYS_INLINE)
 	optCompression              = uint64(C.REGOLITH_OPT_COMPRESSION)
 	optDurability               = uint64(C.REGOLITH_OPT_DURABILITY)
+	optIsolation                = uint64(C.REGOLITH_OPT_ISOLATION)
 )
 
 // Uint64 returns a pointer to the given value, for setting a numeric [Options]
@@ -164,6 +203,22 @@ func (o Options) toC() (C.RegolithOptions, error) {
 	default:
 		return c, fmt.Errorf("%w: invalid option `Durability`: unknown mode %d",
 			ErrInvalidArgument, uint32(o.Durability))
+	}
+
+	switch o.Isolation {
+	case IsolationDefault:
+	case IsolationReadCommitted:
+		c.present |= C.uint64_t(optIsolation)
+		c.isolation = C.REGOLITH_ISOLATION_READ_COMMITTED
+	case IsolationSnapshot:
+		c.present |= C.uint64_t(optIsolation)
+		c.isolation = C.REGOLITH_ISOLATION_SNAPSHOT
+	case IsolationSerializable:
+		c.present |= C.uint64_t(optIsolation)
+		c.isolation = C.REGOLITH_ISOLATION_SERIALIZABLE
+	default:
+		return c, fmt.Errorf("%w: invalid option `Isolation`: unknown level %d",
+			ErrInvalidArgument, uint32(o.Isolation))
 	}
 
 	return c, nil
