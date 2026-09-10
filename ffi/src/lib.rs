@@ -16,6 +16,12 @@
 //! * Output bytes are allocated here; the caller copies them and then
 //!   calls [`regolith_free_buf`]. Output strings are freed with
 //!   [`regolith_free_string`].
+//! * Point reads are the exception: they hand back a **borrowed**
+//!   pointer into memory the engine already owns, plus a
+//!   [`RegolithValue`] handle holding the reference count that keeps it
+//!   there. Nothing is copied on this side. The caller copies and then
+//!   calls [`regolith_release_value`] on every path, promptly: see
+//!   [`RegolithValue`].
 //!
 //! `unsafe` is unavoidable in an FFI shim. It is confined to the raw
 //! pointer helpers in this module plus one documented lifetime extension
@@ -24,6 +30,8 @@
 use std::cell::RefCell;
 use std::ffi::CString;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+
+use regolith::DbSlice;
 
 mod db;
 mod iter;
@@ -176,6 +184,67 @@ pub(crate) unsafe fn out_bytes(bytes: Vec<u8>, out_ptr: *mut *mut u8, out_len: *
     OK
 }
 
+/// Opaque handle keeping a borrowed value's bytes alive.
+///
+/// It boxes nothing but a [`DbSlice`], which is a refcounted view of
+/// bytes the engine already holds: an SSTable data block, a memtable
+/// arena chunk, or a heap buffer the engine made. Holding one **pins**
+/// that owner - a slice over an SSTable block keeps the block resident
+/// even after the block cache evicts it - so a handle is meant to live
+/// only as long as it takes the caller to copy the bytes out. One held
+/// indefinitely is a leak of engine memory, not just of 32 bytes.
+pub struct RegolithValue {
+    /// Held, not read: the pointer handed to the caller addresses the
+    /// engine's bytes directly, and this is what keeps them valid.
+    #[allow(dead_code)]
+    slice: DbSlice,
+}
+
+/// Lend `slice`'s bytes to the caller through `(out_ptr, out_len)`, with
+/// `out_handle` taking the reference count that keeps them alive. The
+/// caller releases it with [`regolith_release_value`].
+///
+/// A zero-length value pins nothing (regolith's empty slice has no
+/// owner), so it yields `(null, 0)` and a **null** handle. Releasing a
+/// null handle is a no-op, so the caller still needs only one
+/// unconditional release.
+///
+/// # Safety
+/// `out_ptr`, `out_len` and `out_handle` must be valid writable
+/// pointers.
+pub(crate) unsafe fn out_borrowed(
+    slice: DbSlice,
+    out_ptr: *mut *const u8,
+    out_len: *mut usize,
+    out_handle: *mut *mut RegolithValue,
+) -> i32 {
+    if out_ptr.is_null() || out_len.is_null() || out_handle.is_null() {
+        set_error("null out-param");
+        // `slice` drops here, so a rejected call releases the pin it was
+        // handed rather than stranding it.
+        return INVALID_ARG;
+    }
+    if slice.is_empty() {
+        unsafe {
+            *out_ptr = std::ptr::null();
+            *out_len = 0;
+            *out_handle = std::ptr::null_mut();
+        }
+        return OK;
+    }
+    // Read the view out before boxing: the bytes live in the engine, not
+    // in the `DbSlice`, so moving the slice into the box does not move
+    // them and the pointer stays valid for as long as the box does.
+    let ptr = slice.as_slice().as_ptr();
+    let len = slice.len();
+    unsafe {
+        *out_ptr = ptr;
+        *out_len = len;
+        *out_handle = Box::into_raw(Box::new(RegolithValue { slice }));
+    }
+    OK
+}
+
 /// Write a boolean out-param as 0/1.
 ///
 /// # Safety
@@ -228,7 +297,31 @@ pub unsafe extern "C" fn regolith_free_string(s: *mut std::ffi::c_char) {
     drop(unsafe { CString::from_raw(s) });
 }
 
-/// Free a buffer handed out by any `_get`/`_key`/`_value` call.
+/// Release a value handle from a `_get_borrowed` call, dropping the
+/// reference count that kept the engine's bytes pinned. The borrowed
+/// pointer that came with it is invalid afterwards. A null handle is a
+/// no-op, which is what a zero-length or not-found read produces.
+///
+/// # Safety
+/// `handle` must be null or a handle from a `_get_borrowed` call that
+/// has not already been released.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn regolith_release_value(handle: *mut RegolithValue) {
+    if handle.is_null() {
+        return;
+    }
+    // Guarded like everything else: dropping the slice drops an arena
+    // refcount, which can return a chunk to the engine's recycling pool.
+    // That is engine code, so it gets the same no-unwind treatment as
+    // the rest of the boundary. The status is discarded because the C
+    // signature has nowhere to put it.
+    let _ = guard(|| {
+        drop(unsafe { Box::from_raw(handle) });
+        OK
+    });
+}
+
+/// Free a buffer handed out by any `_key`/`_value` call.
 ///
 /// # Safety
 /// `(ptr, len)` must be exactly a pair produced by this library and not

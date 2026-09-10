@@ -8,7 +8,8 @@ use regolith::{IsolationLevel, OptimisticTransactionDb, Options};
 use crate::iter::{RegolithIter, RegolithIterOptions};
 use crate::txn::{RegolithTxn, TxnInner};
 use crate::{
-    INVALID_ARG, NOT_FOUND, OK, guard, in_bytes, out_bool, out_bytes, set_error, status_of,
+    INVALID_ARG, NOT_FOUND, OK, RegolithValue, guard, in_bytes, out_bool, out_borrowed, set_error,
+    status_of,
 };
 
 /// Opaque store handle.
@@ -95,18 +96,29 @@ pub unsafe extern "C" fn regolith_db_close(db: *mut RegolithDb) -> i32 {
     })
 }
 
-/// Read `key`. Returns [`NOT_FOUND`] with no allocation when absent.
+/// Read `key`, lending the caller the engine's own bytes.
+///
+/// `get_slice` rather than `get`: `Db::get` is `get_slice` followed by
+/// `DbSlice::into_vec`, which can only move the bytes for a heap-owned
+/// slice at refcount 1. For a value read out of an SSTable block or a
+/// memtable arena - the common case - it copies and allocates. Handing
+/// the slice out instead leaves the caller's copy as the only one.
+///
+/// Returns [`NOT_FOUND`] with no handle produced when absent.
 ///
 /// # Safety
-/// `key` must be valid for `key_len` bytes. On [`OK`] the caller owns
-/// `(*val, *val_len)` and must release it with `regolith_free_buf`.
+/// `key` must be valid for `key_len` bytes. On [`OK`], `(*val, *val_len)`
+/// is **borrowed**: it stays valid only until `regolith_release_value` is
+/// called on `*handle`, which the caller must always do. See
+/// [`crate::RegolithValue`] for why promptly.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn regolith_db_get(
+pub unsafe extern "C" fn regolith_db_get_borrowed(
     db: *mut RegolithDb,
     key: *const u8,
     key_len: usize,
-    val: *mut *mut u8,
+    val: *mut *const u8,
     val_len: *mut usize,
+    value_handle: *mut *mut RegolithValue,
 ) -> i32 {
     guard(|| {
         let handle = db_ref!(db);
@@ -114,8 +126,8 @@ pub unsafe extern "C" fn regolith_db_get(
             set_error("null key");
             return INVALID_ARG;
         };
-        match handle.inner.db().get(key) {
-            Ok(Some(value)) => unsafe { out_bytes(value, val, val_len) },
+        match handle.inner.db().get_slice(key) {
+            Ok(Some(slice)) => unsafe { out_borrowed(slice, val, val_len, value_handle) },
             Ok(None) => NOT_FOUND,
             Err(e) => status_of(&e),
         }
@@ -125,7 +137,7 @@ pub unsafe extern "C" fn regolith_db_get(
 /// Test for the presence of `key`, writing 0/1 to `found`.
 ///
 /// # Safety
-/// As [`regolith_db_get`]; `found` must be writable.
+/// As [`regolith_db_get_borrowed`]; `found` must be writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn regolith_db_has(
     db: *mut RegolithDb,

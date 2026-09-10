@@ -14,8 +14,8 @@ use regolith::OwnedTransaction;
 
 use crate::iter::{RegolithIter, RegolithIterOptions};
 use crate::{
-    DISCARDED, INVALID_ARG, NOT_FOUND, OK, OTHER, READ_ONLY_TXN, guard, in_bytes, out_bool,
-    out_bytes, set_error, txn_status_of,
+    DISCARDED, INVALID_ARG, NOT_FOUND, OK, OTHER, READ_ONLY_TXN, RegolithValue, guard, in_bytes,
+    out_bool, out_borrowed, set_error, txn_status_of,
 };
 
 /// The shared body of a transaction handle.
@@ -79,18 +79,28 @@ macro_rules! txn_ref {
     };
 }
 
-/// Read `key` through the transaction, seeing its own uncommitted writes.
+/// Read `key` through the transaction, seeing its own uncommitted writes
+/// and lending the caller the bytes rather than copying them.
+///
+/// `get_slice` for the same reason as [`crate::regolith_db_get_borrowed`].
+/// The slice a transaction hands back is independent of the transaction:
+/// it holds a reference count on the block, arena or buffered write that
+/// owns the bytes, so it outlives the read lock taken here.
+///
+/// Returns [`NOT_FOUND`] with no handle produced when absent.
 ///
 /// # Safety
-/// `key` must be valid for `key_len` bytes. On [`OK`] the caller owns
-/// `(*val, *val_len)` and releases it with `regolith_free_buf`.
+/// `key` must be valid for `key_len` bytes. On [`OK`], `(*val, *val_len)`
+/// is borrowed until `regolith_release_value` is called on `*handle`,
+/// which the caller must always do.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn regolith_txn_get(
+pub unsafe extern "C" fn regolith_txn_get_borrowed(
     txn: *mut RegolithTxn,
     key: *const u8,
     key_len: usize,
-    val: *mut *mut u8,
+    val: *mut *const u8,
     val_len: *mut usize,
+    value_handle: *mut *mut RegolithValue,
 ) -> i32 {
     guard(|| {
         let handle = txn_ref!(txn);
@@ -98,9 +108,9 @@ pub unsafe extern "C" fn regolith_txn_get(
             set_error("null key");
             return INVALID_ARG;
         };
-        match handle.inner.with(|t| t.get(key)) {
+        match handle.inner.with(|t| t.get_slice(key)) {
             Err(status) => status,
-            Ok(Ok(Some(value))) => unsafe { out_bytes(value, val, val_len) },
+            Ok(Ok(Some(slice))) => unsafe { out_borrowed(slice, val, val_len, value_handle) },
             Ok(Ok(None)) => NOT_FOUND,
             Ok(Err(e)) => txn_status_of(&e),
         }
@@ -110,10 +120,10 @@ pub unsafe extern "C" fn regolith_txn_get(
 /// Test for the presence of `key` through the transaction.
 ///
 /// regolith's `Transaction` has no `has`, so this is `get_slice` with the
-/// value discarded - still cheaper than `get`, which copies.
+/// value discarded.
 ///
 /// # Safety
-/// As [`regolith_txn_get`]; `found` must be writable.
+/// As [`regolith_txn_get_borrowed`]; `found` must be writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn regolith_txn_has(
     txn: *mut RegolithTxn,

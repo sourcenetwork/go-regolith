@@ -55,14 +55,38 @@ fn set(db: *mut RegolithDb, key: &[u8], value: &[u8]) {
     assert_eq!(status, OK, "set failed: {:?}", last_error());
 }
 
-fn get(db: *mut RegolithDb, key: &[u8]) -> Result<Vec<u8>, i32> {
-    let mut val: *mut u8 = ptr::null_mut();
-    let mut len: usize = 0;
-    let status =
-        unsafe { regolith_db_get(db, key.as_ptr(), key.len(), &raw mut val, &raw mut len) };
-    if status == OK {
-        Ok(take_buf(val, len))
+/// Copy a borrowed value and release the handle pinning it, exactly as
+/// `C.GoBytes` plus `regolith_release_value` will. The release happens on
+/// every path, including the failing ones, because the handle holds a
+/// reference count on engine memory.
+fn take_borrowed(ptr: *const u8, len: usize, handle: *mut RegolithValue) -> Vec<u8> {
+    let copied = if len == 0 {
+        Vec::new()
     } else {
+        unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+    };
+    unsafe { regolith_release_value(handle) };
+    copied
+}
+
+fn get(db: *mut RegolithDb, key: &[u8]) -> Result<Vec<u8>, i32> {
+    let mut val: *const u8 = ptr::null();
+    let mut len: usize = 0;
+    let mut handle: *mut RegolithValue = ptr::null_mut();
+    let status = unsafe {
+        regolith_db_get_borrowed(
+            db,
+            key.as_ptr(),
+            key.len(),
+            &raw mut val,
+            &raw mut len,
+            &raw mut handle,
+        )
+    };
+    if status == OK {
+        Ok(take_borrowed(val, len, handle))
+    } else {
+        assert!(handle.is_null(), "a failed get must produce no handle");
         Err(status)
     }
 }
@@ -75,13 +99,23 @@ fn has(db: *mut RegolithDb, key: &[u8]) -> bool {
 }
 
 fn txn_get(txn: *mut RegolithTxn, key: &[u8]) -> Result<Vec<u8>, i32> {
-    let mut val: *mut u8 = ptr::null_mut();
+    let mut val: *const u8 = ptr::null();
     let mut len: usize = 0;
-    let status =
-        unsafe { regolith_txn_get(txn, key.as_ptr(), key.len(), &raw mut val, &raw mut len) };
+    let mut handle: *mut RegolithValue = ptr::null_mut();
+    let status = unsafe {
+        regolith_txn_get_borrowed(
+            txn,
+            key.as_ptr(),
+            key.len(),
+            &raw mut val,
+            &raw mut len,
+            &raw mut handle,
+        )
+    };
     if status == OK {
-        Ok(take_buf(val, len))
+        Ok(take_borrowed(val, len, handle))
     } else {
+        assert!(handle.is_null(), "a failed get must produce no handle");
         Err(status)
     }
 }
@@ -202,9 +236,20 @@ fn noop_is_callable() {
 #[test]
 fn null_handles_are_errors_not_crashes() {
     assert_eq!(
-        unsafe { regolith_db_get(ptr::null_mut(), b"k".as_ptr(), 1, ptr::null_mut(), ptr::null_mut()) },
+        unsafe {
+            regolith_db_get_borrowed(
+                ptr::null_mut(),
+                b"k".as_ptr(),
+                1,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        },
         INVALID_ARG
     );
+    // Releasing nothing is how a not-found or empty read is released.
+    unsafe { regolith_release_value(ptr::null_mut()) };
     assert_eq!(unsafe { regolith_db_close(ptr::null_mut()) }, INVALID_ARG);
     assert_eq!(unsafe { regolith_txn_commit(ptr::null_mut()) }, INVALID_ARG);
     assert_eq!(unsafe { regolith_iter_close(ptr::null_mut()) }, INVALID_ARG);
@@ -279,6 +324,260 @@ fn drop_all_empties_the_store() {
     // Still usable afterwards.
     set(db, b"fresh", b"v");
     assert_eq!(get(db, b"fresh").unwrap(), b"v");
+    close(db);
+}
+
+// ---------------------------------------------------------------------
+// Borrowed point reads
+//
+// `regolith_db_get_borrowed` and `regolith_txn_get_borrowed` hand out a
+// pointer into memory the engine still owns, plus the handle holding the
+// reference count that keeps it there. The helpers above already exercise
+// the happy path everywhere; these tests pin down the edges of the
+// ownership contract, which is what a leak or a use-after-free would be
+// hiding in.
+// ---------------------------------------------------------------------
+
+/// One raw `regolith_db_get_borrowed` call, nothing released. Returns
+/// everything the caller can observe so a test can assert on it.
+fn get_raw(db: *mut RegolithDb, key: &[u8]) -> (i32, *const u8, usize, *mut RegolithValue) {
+    let mut val: *const u8 = ptr::null();
+    let mut len: usize = 0;
+    let mut handle: *mut RegolithValue = ptr::null_mut();
+    let status = unsafe {
+        regolith_db_get_borrowed(
+            db,
+            key.as_ptr(),
+            key.len(),
+            &raw mut val,
+            &raw mut len,
+            &raw mut handle,
+        )
+    };
+    (status, val, len, handle)
+}
+
+#[test]
+fn borrowed_get_lends_the_value_and_takes_it_back() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    set(db, b"k", b"hello");
+
+    let (status, val, len, handle) = get_raw(db, b"k");
+    assert_eq!(status, OK, "{:?}", last_error());
+    assert!(!handle.is_null(), "a non-empty value must come with a handle");
+    assert_eq!(len, 5);
+    // The bytes are readable while the handle is held. This is the whole
+    // point: no copy was made on the way out.
+    assert_eq!(unsafe { std::slice::from_raw_parts(val, len) }, b"hello");
+    unsafe { regolith_release_value(handle) };
+
+    close(db);
+}
+
+#[test]
+fn borrowed_get_miss_produces_no_handle() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    seed(db);
+
+    let (status, val, len, handle) = get_raw(db, b"absent");
+    assert_eq!(status, NOT_FOUND);
+    // Nothing was written, so the caller's zeroed locals are untouched
+    // and its unconditional release is a no-op.
+    assert!(handle.is_null());
+    assert!(val.is_null());
+    assert_eq!(len, 0);
+    unsafe { regolith_release_value(handle) };
+
+    close(db);
+}
+
+#[test]
+fn borrowed_get_of_an_empty_value_pins_nothing() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    set(db, b"k", b"");
+
+    // Present, but zero length: regolith's empty slice has no owner, so
+    // there is nothing to pin and no handle to hand back. The Go binding
+    // turns this into a nil slice.
+    let (status, val, len, handle) = get_raw(db, b"k");
+    assert_eq!(status, OK, "{:?}", last_error());
+    assert_eq!(len, 0);
+    assert!(val.is_null());
+    assert!(handle.is_null());
+    unsafe { regolith_release_value(handle) };
+
+    assert!(has(db, b"k"), "an empty value is still an entry");
+    assert!(get(db, b"k").unwrap().is_empty());
+
+    close(db);
+}
+
+#[test]
+fn borrowed_get_reads_bytes_owned_by_an_sstable_block() {
+    let dir = TempDir::new().unwrap();
+
+    // The FFI has no flush, and the default write buffer is 64 MiB, so
+    // the store is built with the engine directly to get the values out
+    // of the memtable arena and into an L0 file. Everything read back
+    // below is therefore a slice over a decoded SSTable block rather
+    // than over an arena chunk, which is the owner the production read
+    // path hits most and the one `into_vec` used to copy.
+    {
+        let db = regolith::Db::open(dir.path(), regolith::Options::default()).unwrap();
+        for i in 0..64u32 {
+            db.put(format!("key{i:04}").as_bytes(), &vec![b'a' + (i % 26) as u8; 300])
+                .unwrap();
+        }
+        db.flush().unwrap();
+        db.close().unwrap();
+    }
+
+    let db = open(&dir);
+    for i in 0..64u32 {
+        let expected = vec![b'a' + (i % 26) as u8; 300];
+        assert_eq!(
+            get(db, format!("key{i:04}").as_bytes()).unwrap(),
+            expected,
+            "key{i:04} came back wrong"
+        );
+    }
+
+    // A value overwritten after the flush is served from the arena again,
+    // so both owners are covered in one store.
+    set(db, b"key0000", b"fresh");
+    assert_eq!(get(db, b"key0000").unwrap(), b"fresh");
+
+    close(db);
+}
+
+#[test]
+fn db_is_usable_after_values_are_released() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    set(db, b"k", b"v");
+
+    // Take and release the same value repeatedly: releasing a handle
+    // must not disturb what it pointed at, and must leave the store and
+    // its block cache fit to serve the next read.
+    for _ in 0..1_000 {
+        let (status, val, len, handle) = get_raw(db, b"k");
+        assert_eq!(status, OK);
+        assert_eq!(unsafe { std::slice::from_raw_parts(val, len) }, b"v");
+        unsafe { regolith_release_value(handle) };
+    }
+
+    set(db, b"k", b"v2");
+    assert_eq!(get(db, b"k").unwrap(), b"v2");
+    assert_eq!(unsafe { regolith_db_drop_all(db) }, OK);
+    assert_eq!(get(db, b"k"), Err(NOT_FOUND));
+
+    close(db);
+}
+
+#[test]
+fn borrowed_get_rejects_null_out_params() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    set(db, b"k", b"v");
+
+    let mut val: *const u8 = ptr::null();
+    let mut len: usize = 0;
+    let mut handle: *mut RegolithValue = ptr::null_mut();
+
+    // Each out-param is rejected on its own, and the slice the engine
+    // handed over is dropped rather than stranded.
+    for (v, l, h) in [
+        (ptr::null_mut(), &raw mut len, &raw mut handle),
+        (&raw mut val, ptr::null_mut(), &raw mut handle),
+        (&raw mut val, &raw mut len, ptr::null_mut()),
+    ] {
+        assert_eq!(
+            unsafe { regolith_db_get_borrowed(db, b"k".as_ptr(), 1, v, l, h) },
+            INVALID_ARG
+        );
+    }
+    assert!(handle.is_null(), "a rejected call must not hand out a handle");
+
+    // A null key pointer with a non-zero length is still an argument
+    // error, and the store is unharmed by any of it.
+    assert_eq!(
+        unsafe {
+            regolith_db_get_borrowed(
+                db,
+                ptr::null(),
+                1,
+                &raw mut val,
+                &raw mut len,
+                &raw mut handle,
+            )
+        },
+        INVALID_ARG
+    );
+    assert_eq!(get(db, b"k").unwrap(), b"v");
+
+    close(db);
+}
+
+#[test]
+fn txn_borrowed_get_covers_buffered_empty_and_absent() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    set(db, b"stored", b"v");
+    set(db, b"blank", b"");
+
+    let txn = begin(db, false);
+
+    // Committed, buffered, empty and absent, all through the borrowed
+    // path.
+    assert_eq!(txn_get(txn, b"stored").unwrap(), b"v");
+    assert_eq!(txn_set(txn, b"buffered", b"vb"), OK);
+    assert_eq!(txn_get(txn, b"buffered").unwrap(), b"vb");
+    assert!(txn_get(txn, b"blank").unwrap().is_empty());
+    assert_eq!(txn_get(txn, b"absent"), Err(NOT_FOUND));
+
+    let mut val: *const u8 = ptr::null();
+    let mut len: usize = 0;
+    let mut handle: *mut RegolithValue = ptr::null_mut();
+    assert_eq!(
+        unsafe {
+            regolith_txn_get_borrowed(
+                txn,
+                b"stored".as_ptr(),
+                6,
+                ptr::null_mut(),
+                &raw mut len,
+                &raw mut handle,
+            )
+        },
+        INVALID_ARG
+    );
+    assert!(handle.is_null());
+
+    // A value borrowed through a transaction is independent of it: the
+    // copy was taken before the transaction resolved, and releasing the
+    // handle afterwards is still correct.
+    assert_eq!(
+        unsafe {
+            regolith_txn_get_borrowed(
+                txn,
+                b"stored".as_ptr(),
+                6,
+                &raw mut val,
+                &raw mut len,
+                &raw mut handle,
+            )
+        },
+        OK
+    );
+    let copied = unsafe { std::slice::from_raw_parts(val, len) }.to_vec();
+    assert_eq!(unsafe { regolith_txn_discard(txn) }, OK);
+    assert_eq!(unsafe { regolith_txn_free(txn) }, OK);
+    unsafe { regolith_release_value(handle) };
+    assert_eq!(copied, b"v");
+
     close(db);
 }
 
