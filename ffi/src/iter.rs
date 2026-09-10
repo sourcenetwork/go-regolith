@@ -18,14 +18,31 @@
 //! iterator starts un-positioned with a pending reset, so the first
 //! `next` call positions it on the first in-range entry rather than
 //! advancing past it.
+//!
+//! # Batched iteration
+//!
+//! Crossing the FFI boundary three times per entry (`next`, `key`,
+//! `value`) is the only part of this shim that costs anything at scale,
+//! so `regolith_iter_next_batch` walks up to `max_entries` at a time and
+//! frames the **keys** into one buffer. Keys are copied whatever happens
+//! - a data block stores them prefix-compressed, so the cursor
+//! reassembles each one into a buffer it owns - which is exactly why
+//! batching them is free of extra copies.
+//!
+//! Values are deliberately *not* framed. A batch retains one
+//! [`DbSlice`] per entry instead, which is a reference count rather than
+//! a copy, and `regolith_iter_batch_value` hands out a borrowed pointer
+//! to the one the caller actually asks for. A caller that reads keys
+//! only never pays for value bytes.
 
 use std::sync::Arc;
 
-use regolith::{OwnedSnapshotIter, ScanDirection, Snapshot, TxnScanStream};
+use regolith::{DbSlice, OwnedSnapshotIter, ScanDirection, Snapshot, TxnScanStream};
 
 use crate::txn::TxnInner;
 use crate::{
-    INVALID_ARG, NOT_FOUND, OK, guard, in_opt_bytes, out_bool, out_bytes, set_error, status_of,
+    INVALID_ARG, NOT_FOUND, OK, OTHER, guard, in_opt_bytes, out_bool, out_bytes, set_error,
+    status_of,
 };
 
 /// Iteration options, laid out for C. A byte range is absent when its
@@ -152,9 +169,21 @@ enum Source {
 
 struct Entry {
     key: Vec<u8>,
-    /// `None` under `KeysOnly`.
-    value: Option<Vec<u8>>,
+    /// `None` under `KeysOnly`. A [`DbSlice`] rather than a `Vec` so a
+    /// batch can retain it with a reference count instead of a copy.
+    value: Option<DbSlice>,
 }
+
+/// How many value bytes one batch may keep referenced.
+///
+/// A held [`DbSlice`] pins whatever owns its bytes - an SSTable block
+/// stays resident even after the block cache evicts it - so a batch is
+/// meant to be brief. Entry count alone does not bound that, because a
+/// value can be arbitrarily large, so a batch also stops once it has
+/// retained this much. With small values the cap is never reached; with
+/// megabyte values a batch degenerates to a single entry, which is the
+/// right answer.
+const MAX_BATCH_VALUE_BYTES: usize = 1 << 20;
 
 /// Opaque iterator handle.
 pub struct RegolithIter {
@@ -163,6 +192,22 @@ pub struct RegolithIter {
     /// Set at construction and by `regolith_iter_reset`: the next `next`
     /// call positions at the start of the range rather than advancing.
     reset: bool,
+    /// Set by `regolith_iter_seek`: the cursor already sits on the entry
+    /// the caller asked for, so the next batch must *include* it rather
+    /// than step past it. Single-entry `regolith_iter_next` keeps its
+    /// documented behaviour of advancing, and clears this.
+    include_current: bool,
+    /// Values retained by the most recent batch, in batch order and
+    /// empty under `KeysOnly`. Cleared by every batch, seek and reset,
+    /// so nothing stays pinned longer than it is addressable.
+    batch_values: Vec<DbSlice>,
+    /// Entries in the most recent batch. Not `batch_values.len()`, which
+    /// is zero under `KeysOnly`, and the index bound for
+    /// `regolith_iter_batch_value`.
+    batch_count: usize,
+    /// A read error hit part way through a batch, reported on the next
+    /// call so the entries already gathered are not thrown away.
+    pending: Option<i32>,
 }
 
 impl RegolithIter {
@@ -171,6 +216,10 @@ impl RegolithIter {
             bounds,
             source: Source::Snapshot(snapshot.into_owned_iter()),
             reset: true,
+            include_current: false,
+            batch_values: Vec::new(),
+            batch_count: 0,
+            pending: None,
         }
     }
 
@@ -186,6 +235,10 @@ impl RegolithIter {
                 current: None,
             },
             reset: true,
+            include_current: false,
+            batch_values: Vec::new(),
+            batch_count: 0,
+            pending: None,
         })
     }
 
@@ -250,6 +303,12 @@ impl RegolithIter {
     /// Position on the entry `Seek` should land on, clamped to the range.
     fn seek(&mut self, target: &[u8]) -> Result<bool, i32> {
         self.reset = false;
+        self.pending = None;
+        self.invalidate_batch();
+        // A batch taken after a seek starts at the entry the seek landed
+        // on. `regolith_iter_next` is unaffected: it clears this and
+        // advances, as its contract says.
+        self.include_current = true;
         if self.bounds.reverse {
             self.seek_reverse(target)
         } else {
@@ -371,11 +430,7 @@ impl RegolithIter {
             Some((key, value)) => {
                 *current = Some(Entry {
                     key,
-                    value: if keys_only {
-                        None
-                    } else {
-                        Some(value.as_ref().to_vec())
-                    },
+                    value: if keys_only { None } else { Some(value) },
                 });
                 Ok(true)
             }
@@ -438,6 +493,42 @@ impl RegolithIter {
             Source::Txn { current, .. } => current.as_ref().and_then(|e| e.value.as_deref()),
         }
     }
+
+    /// The current value as a retainable reference, or `None` under
+    /// `KeysOnly` or off a valid entry.
+    ///
+    /// Cloning a [`DbSlice`] is a reference count, not a byte copy, on
+    /// both the forward and the reverse path.
+    fn current_value_slice(&self) -> Option<DbSlice> {
+        if self.bounds.keys_only || !self.in_range() {
+            return None;
+        }
+        match &self.source {
+            Source::Snapshot(cursor) => cursor.value_slice(),
+            Source::Txn { current, .. } => current.as_ref().and_then(|e| e.value.clone()),
+        }
+    }
+
+    /// Drop the values the last batch retained, unpinning their owners.
+    fn invalidate_batch(&mut self) {
+        self.batch_values.clear();
+        self.batch_count = 0;
+    }
+
+    /// Move onto the entry a batch's `n`th iteration should frame.
+    fn advance_in_batch(&mut self) -> Result<bool, i32> {
+        if self.reset {
+            self.reset = false;
+            self.include_current = false;
+            return self.restart();
+        }
+        if self.include_current {
+            // A seek already positioned the cursor; framing starts here.
+            self.include_current = false;
+            return Ok(self.in_range());
+        }
+        self.step()
+    }
 }
 
 macro_rules! iter_ref {
@@ -463,6 +554,9 @@ macro_rules! iter_ref {
 pub unsafe extern "C" fn regolith_iter_next(it: *mut RegolithIter, valid: *mut u8) -> i32 {
     guard(|| {
         let iter = iter_ref!(it);
+        // Single-entry stepping ignores a pending seek position: its
+        // contract is that a `next` after a `seek` advances from there.
+        iter.include_current = false;
         let moved = if iter.reset {
             iter.reset = false;
             iter.restart()
@@ -511,6 +605,9 @@ pub unsafe extern "C" fn regolith_iter_reset(it: *mut RegolithIter) -> i32 {
     guard(|| {
         let iter = iter_ref!(it);
         iter.reset = true;
+        iter.include_current = false;
+        iter.pending = None;
+        iter.invalidate_batch();
         OK
     })
 }
@@ -559,6 +656,140 @@ pub unsafe extern "C" fn regolith_iter_value(
         // side's contract is `nil, nil`.
         let value = iter.current_value().unwrap_or(&[]).to_vec();
         unsafe { out_bytes(value, val, val_len) }
+    })
+}
+
+/// Advance up to `max_entries` times, framing the **keys** walked into
+/// one buffer as `[u32 key_len][key bytes]` repeated `*out_count` times,
+/// little-endian.
+///
+/// The first iteration of the batch honours the same positioning rule as
+/// [`regolith_iter_next`]: after construction or `regolith_iter_reset`
+/// it positions on the first in-range entry rather than advancing, and
+/// after a `regolith_iter_seek` it starts on the entry the seek landed
+/// on rather than stepping past it.
+///
+/// `*out_count == 0` is the only signal that the range is exhausted. A
+/// short batch does not mean exhaustion: it can also be the retained
+/// value cap ([`MAX_BATCH_VALUE_BYTES`]) or a read error being held back
+/// until the next call.
+///
+/// Values are not framed. One [`DbSlice`] per entry is retained instead,
+/// addressable through [`regolith_iter_batch_value`] until the next
+/// batch, seek, reset or close. Under `KeysOnly` nothing is retained.
+///
+/// # Safety
+/// `it` must be a live handle; `out`, `out_len` and `out_count` must be
+/// writable. On [`OK`] the caller owns `(*out, *out_len)` and releases
+/// it with `regolith_free_buf`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn regolith_iter_next_batch(
+    it: *mut RegolithIter,
+    max_entries: usize,
+    out: *mut *mut u8,
+    out_len: *mut usize,
+    out_count: *mut usize,
+) -> i32 {
+    guard(|| {
+        let iter = iter_ref!(it);
+        if out.is_null() || out_len.is_null() || out_count.is_null() {
+            set_error("null out-param");
+            return INVALID_ARG;
+        }
+        if max_entries == 0 {
+            // An empty batch is indistinguishable from exhaustion, so
+            // asking for one is a caller bug rather than a no-op.
+            set_error("max_entries must be at least 1");
+            return INVALID_ARG;
+        }
+        // The previous batch's values stop being addressable here.
+        iter.invalidate_batch();
+        if let Some(status) = iter.pending.take() {
+            return status;
+        }
+
+        let mut frame: Vec<u8> = Vec::new();
+        let mut count: usize = 0;
+        let mut retained: usize = 0;
+        while count < max_entries {
+            match iter.advance_in_batch() {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(status) => {
+                    if count == 0 {
+                        return status;
+                    }
+                    // Hand back what was gathered and report the failure
+                    // on the next call, so it is surfaced but nothing
+                    // already walked is lost.
+                    iter.pending = Some(status);
+                    break;
+                }
+            }
+            let Some(key) = iter.current_key() else { break };
+            let Ok(key_len) = u32::try_from(key.len()) else {
+                set_error("key longer than 4 GiB");
+                return OTHER;
+            };
+            frame.extend_from_slice(&key_len.to_le_bytes());
+            frame.extend_from_slice(key);
+            count += 1;
+
+            if let Some(value) = iter.current_value_slice() {
+                retained += value.len();
+                iter.batch_values.push(value);
+                if retained >= MAX_BATCH_VALUE_BYTES {
+                    break;
+                }
+            }
+        }
+
+        iter.batch_count = count;
+        unsafe { *out_count = count };
+        unsafe { out_bytes(frame, out, out_len) }
+    })
+}
+
+/// Borrow the value of entry `idx` of the current batch. Nothing is
+/// allocated and nothing has to be freed; the pointer addresses bytes
+/// the iterator is holding a reference count on.
+///
+/// Under `KeysOnly` an in-range index yields `(null, 0)`, matching
+/// [`regolith_iter_value`]'s empty buffer. An index at or beyond the
+/// last batch's entry count is [`INVALID_ARG`].
+///
+/// # Safety
+/// `it` must be a live handle and `val`/`val_len` writable. The returned
+/// pointer is valid until the next `regolith_iter_next_batch`,
+/// `regolith_iter_seek`, `regolith_iter_reset` or `regolith_iter_close`
+/// on this handle, and must not be freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn regolith_iter_batch_value(
+    it: *mut RegolithIter,
+    idx: usize,
+    val: *mut *const u8,
+    val_len: *mut usize,
+) -> i32 {
+    guard(|| {
+        let iter = iter_ref!(it);
+        if val.is_null() || val_len.is_null() {
+            set_error("null out-param");
+            return INVALID_ARG;
+        }
+        if idx >= iter.batch_count {
+            set_error("batch value index out of range");
+            return INVALID_ARG;
+        }
+        let (ptr, len) = match iter.batch_values.get(idx) {
+            Some(slice) => (slice.as_slice().as_ptr(), slice.len()),
+            // `KeysOnly` retains nothing.
+            None => (std::ptr::null(), 0),
+        };
+        unsafe {
+            *val = ptr;
+            *val_len = len;
+        }
+        OK
     })
 }
 

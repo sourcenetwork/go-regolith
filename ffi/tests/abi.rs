@@ -767,3 +767,364 @@ fn null_iter_options_means_full_forward_iteration() {
 
     close(db);
 }
+
+// ---------------------------------------------------------------------
+// Batched iteration
+//
+// `regolith_iter_next_batch` frames keys only and retains one value
+// reference per entry, so these tests check the framing, the positioning
+// rules it shares with `regolith_iter_next`, and that values read back by
+// index line up with the keys they were framed beside.
+// ---------------------------------------------------------------------
+
+/// Take one batch, decode the `[u32 key_len][key bytes]` frame and check
+/// it against `*out_count`.
+fn next_batch(it: *mut RegolithIter, max_entries: usize) -> Vec<String> {
+    let mut out: *mut u8 = ptr::null_mut();
+    let mut len: usize = 0;
+    let mut count: usize = usize::MAX;
+    let status = unsafe {
+        regolith_iter_next_batch(it, max_entries, &raw mut out, &raw mut len, &raw mut count)
+    };
+    assert_eq!(status, OK, "next_batch failed: {:?}", last_error());
+    assert!(count <= max_entries, "a batch must not exceed max_entries");
+    let frame = take_buf(out, len);
+
+    let mut keys = Vec::new();
+    let mut at = 0usize;
+    while at < frame.len() {
+        let key_len = u32::from_le_bytes(frame[at..at + 4].try_into().unwrap()) as usize;
+        at += 4;
+        keys.push(String::from_utf8(frame[at..at + key_len].to_vec()).unwrap());
+        at += key_len;
+    }
+    assert_eq!(keys.len(), count, "framed keys must match *out_count");
+    keys
+}
+
+/// Borrow value `idx` of the current batch. Nothing is freed: the
+/// pointer addresses bytes the iterator holds a reference on.
+fn batch_value(it: *mut RegolithIter, idx: usize) -> Result<Vec<u8>, i32> {
+    let mut val: *const u8 = ptr::null();
+    let mut len: usize = 0;
+    let status = unsafe { regolith_iter_batch_value(it, idx, &raw mut val, &raw mut len) };
+    if status != OK {
+        return Err(status);
+    }
+    Ok(if len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(val, len) }.to_vec()
+    })
+}
+
+/// Walk to exhaustion in batches of `max_entries`, reading every value.
+fn drain_batched(it: *mut RegolithIter, max_entries: usize) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    loop {
+        let batch = next_batch(it, max_entries);
+        // Exhaustion is `*out_count == 0`, never a short batch.
+        if batch.is_empty() {
+            return out;
+        }
+        for (idx, key) in batch.iter().enumerate() {
+            let value = String::from_utf8(batch_value(it, idx).unwrap()).unwrap();
+            out.push((key.clone(), value));
+        }
+    }
+}
+
+#[test]
+fn batch_smaller_than_the_range() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    seed(db);
+
+    let options = opts(None, None, None, false, false);
+    let it = db_iter(db, &options);
+
+    // First batch positions rather than advancing, so `a` is included.
+    assert_eq!(next_batch(it, 2), ["a", "b"]);
+    assert_eq!(batch_value(it, 0).unwrap(), b"va");
+    assert_eq!(batch_value(it, 1).unwrap(), b"vb");
+    assert_eq!(next_batch(it, 2), ["c", "d"]);
+    assert_eq!(batch_value(it, 0).unwrap(), b"vc");
+    assert_eq!(next_batch(it, 2), ["e"]);
+    assert_eq!(batch_value(it, 0).unwrap(), b"ve");
+    assert!(next_batch(it, 2).is_empty());
+    assert!(next_batch(it, 2).is_empty());
+
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+    close(db);
+}
+
+#[test]
+fn batch_on_an_exact_multiple_of_the_range() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    seed(db);
+
+    let options = opts(None, None, None, false, false);
+
+    // A batch exactly the size of the range fills, and the next one is
+    // the empty batch that reports exhaustion.
+    let it = db_iter(db, &options);
+    assert_eq!(next_batch(it, 5), ["a", "b", "c", "d", "e"]);
+    assert_eq!(batch_value(it, 4).unwrap(), b"ve");
+    assert!(next_batch(it, 5).is_empty());
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    // And so does a range that is an exact multiple of a smaller batch.
+    let options = opts(None, Some(b"a"), Some(b"e"), false, false);
+    let it = db_iter(db, &options);
+    assert_eq!(next_batch(it, 2), ["a", "b"]);
+    assert_eq!(next_batch(it, 2), ["c", "d"]);
+    assert!(next_batch(it, 2).is_empty());
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    close(db);
+}
+
+#[test]
+fn batch_on_an_empty_range_is_exhausted_immediately() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    seed(db);
+
+    let options = opts(None, Some(b"x"), Some(b"z"), false, false);
+    let it = db_iter(db, &options);
+    assert!(next_batch(it, 8).is_empty());
+    // Nothing was retained, so every index is out of range.
+    assert_eq!(batch_value(it, 0), Err(INVALID_ARG));
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    close(db);
+}
+
+#[test]
+fn batch_matches_single_stepping_for_reverse_and_prefix() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    seed(db);
+    set(db, b"pre:1", b"v1");
+    set(db, b"pre:2", b"v2");
+
+    for max_entries in [1usize, 2, 256] {
+        let options = opts(None, None, None, true, false);
+        let it = db_iter(db, &options);
+        assert_eq!(
+            drain_batched(it, max_entries),
+            vec![
+                ("pre:2".to_string(), "v2".to_string()),
+                ("pre:1".to_string(), "v1".to_string()),
+                ("e".to_string(), "ve".to_string()),
+                ("d".to_string(), "vd".to_string()),
+                ("c".to_string(), "vc".to_string()),
+                ("b".to_string(), "vb".to_string()),
+                ("a".to_string(), "va".to_string()),
+            ],
+            "reverse batch of {max_entries}"
+        );
+        assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+        let options = opts(Some(b"pre:"), None, None, false, false);
+        let it = db_iter(db, &options);
+        let entries = drain_batched(it, max_entries);
+        assert_eq!(keys(&entries), ["pre:1", "pre:2"], "prefix batch of {max_entries}");
+        assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+        // Reverse and prefix together, which is where the clamping and
+        // the batch's first-iteration rule interact.
+        let options = opts(Some(b"pre:"), None, None, true, false);
+        let it = db_iter(db, &options);
+        let entries = drain_batched(it, max_entries);
+        assert_eq!(keys(&entries), ["pre:2", "pre:1"], "reverse prefix of {max_entries}");
+        assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+    }
+
+    close(db);
+}
+
+#[test]
+fn batch_under_keys_only_retains_no_values() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    seed(db);
+
+    let options = opts(None, None, None, false, true);
+    let it = db_iter(db, &options);
+
+    assert_eq!(next_batch(it, 3), ["a", "b", "c"]);
+    // In-range indices read back empty rather than failing, matching
+    // `regolith_iter_value` under `KeysOnly`.
+    for idx in 0..3 {
+        assert_eq!(batch_value(it, idx), Ok(Vec::new()));
+    }
+    // Past the batch is still an error, so a caller bug is not hidden by
+    // the empty-value rule.
+    assert_eq!(batch_value(it, 3), Err(INVALID_ARG));
+
+    assert_eq!(next_batch(it, 3), ["d", "e"]);
+    assert_eq!(batch_value(it, 1), Ok(Vec::new()));
+    assert_eq!(batch_value(it, 2), Err(INVALID_ARG));
+
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+    close(db);
+}
+
+#[test]
+fn batch_after_a_seek_includes_the_sought_entry() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    seed(db);
+
+    let options = opts(None, None, None, false, false);
+    let it = db_iter(db, &options);
+
+    // Exact match.
+    assert!(iter_seek(it, b"c"));
+    assert_eq!(next_batch(it, 2), ["c", "d"]);
+    assert_eq!(batch_value(it, 0).unwrap(), b"vc");
+    // Inexact, landing on the next key up.
+    assert!(iter_seek(it, b"bb"));
+    assert_eq!(next_batch(it, 8), ["c", "d", "e"]);
+    // A seek past the end yields an empty batch, not the range again.
+    assert!(!iter_seek(it, b"z"));
+    assert!(next_batch(it, 8).is_empty());
+    // Single stepping keeps its own contract: it advances past the seek.
+    assert!(iter_seek(it, b"c"));
+    assert!(iter_next(it));
+    assert_eq!(iter_key(it), b"d");
+    // And a batch taken after that stepping continues from there.
+    assert_eq!(next_batch(it, 8), ["e"]);
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    // In reverse a seek lands on the greatest key <= the target, and the
+    // batch starts there and walks down.
+    let options = opts(None, None, None, true, false);
+    let it = db_iter(db, &options);
+    assert!(iter_seek(it, b"bb"));
+    assert_eq!(next_batch(it, 8), ["b", "a"]);
+    assert_eq!(batch_value(it, 0).unwrap(), b"vb");
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+
+    close(db);
+}
+
+#[test]
+fn reset_re_batches_from_the_start_of_the_range() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    seed(db);
+
+    let options = opts(None, Some(b"b"), Some(b"e"), false, false);
+    let it = db_iter(db, &options);
+
+    assert_eq!(keys(&drain_batched(it, 2)), ["b", "c", "d"]);
+    assert!(next_batch(it, 2).is_empty());
+
+    assert_eq!(unsafe { regolith_iter_reset(it) }, OK);
+    assert_eq!(keys(&drain_batched(it, 2)), ["b", "c", "d"]);
+
+    // A reset mid-batch, and a reset after a seek, both return to the
+    // start of the range.
+    assert_eq!(unsafe { regolith_iter_reset(it) }, OK);
+    assert_eq!(next_batch(it, 2), ["b", "c"]);
+    assert_eq!(unsafe { regolith_iter_reset(it) }, OK);
+    assert_eq!(next_batch(it, 2), ["b", "c"]);
+    assert!(iter_seek(it, b"d"));
+    assert_eq!(unsafe { regolith_iter_reset(it) }, OK);
+    assert_eq!(next_batch(it, 2), ["b", "c"]);
+    // The reset dropped the previous batch's values with it.
+    assert_eq!(batch_value(it, 2), Err(INVALID_ARG));
+
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+    close(db);
+}
+
+#[test]
+fn batch_values_are_addressable_by_index_and_bounded() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    // Values distinct in length as well as content, so a wrong index or
+    // a stale pointer cannot pass.
+    for (i, key) in ["k1", "k2", "k3"].iter().enumerate() {
+        set(db, key.as_bytes(), "x".repeat(i + 1).as_bytes());
+    }
+    set(db, b"k4", b"");
+
+    let options = opts(None, None, None, false, false);
+    let it = db_iter(db, &options);
+
+    assert_eq!(next_batch(it, 4), ["k1", "k2", "k3", "k4"]);
+    assert_eq!(batch_value(it, 0).unwrap(), b"x");
+    assert_eq!(batch_value(it, 1).unwrap(), b"xx");
+    assert_eq!(batch_value(it, 2).unwrap(), b"xxx");
+    // An empty value is a zero-length read, not a failure.
+    assert_eq!(batch_value(it, 3), Ok(Vec::new()));
+    // Out of range, including absurdly so.
+    assert_eq!(batch_value(it, 4), Err(INVALID_ARG));
+    assert_eq!(batch_value(it, usize::MAX), Err(INVALID_ARG));
+
+    // Reading out of order, and twice, is fine: the pointers are
+    // borrowed from slices the iterator still holds.
+    assert_eq!(batch_value(it, 2).unwrap(), b"xxx");
+    assert_eq!(batch_value(it, 0).unwrap(), b"x");
+
+    // Null out-params and a zero batch size are argument errors.
+    let mut len: usize = 0;
+    assert_eq!(
+        unsafe { regolith_iter_batch_value(it, 0, ptr::null_mut(), &raw mut len) },
+        INVALID_ARG
+    );
+    let mut out: *mut u8 = ptr::null_mut();
+    let mut count: usize = 0;
+    assert_eq!(
+        unsafe { regolith_iter_next_batch(it, 0, &raw mut out, &raw mut len, &raw mut count) },
+        INVALID_ARG
+    );
+    assert_eq!(
+        unsafe {
+            regolith_iter_next_batch(ptr::null_mut(), 8, &raw mut out, &raw mut len, &raw mut count)
+        },
+        INVALID_ARG
+    );
+
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+    close(db);
+}
+
+#[test]
+fn batch_over_a_txn_merges_buffered_writes() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+    seed(db);
+
+    let txn = begin(db, false);
+    assert_eq!(txn_set(txn, b"bb", b"vbb"), OK);
+    assert_eq!(txn_set(txn, b"c", b"updated"), OK);
+
+    let options = opts(None, None, None, false, false);
+    let it = txn_iter(txn, &options);
+    assert_eq!(
+        drain_batched(it, 2),
+        vec![
+            ("a".to_string(), "va".to_string()),
+            ("b".to_string(), "vb".to_string()),
+            ("bb".to_string(), "vbb".to_string()),
+            ("c".to_string(), "updated".to_string()),
+            ("d".to_string(), "vd".to_string()),
+            ("e".to_string(), "ve".to_string()),
+        ]
+    );
+
+    // A seek rebuilds the stream; the batch after it still starts on the
+    // entry sought.
+    assert!(iter_seek(it, b"bb"));
+    assert_eq!(next_batch(it, 2), ["bb", "c"]);
+    assert_eq!(batch_value(it, 1).unwrap(), b"updated");
+
+    assert_eq!(unsafe { regolith_iter_close(it) }, OK);
+    assert_eq!(unsafe { regolith_txn_free(txn) }, OK);
+    close(db);
+}

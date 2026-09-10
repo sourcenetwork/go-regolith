@@ -47,6 +47,11 @@
  *   passing back exactly the pair it received. A zero-length output does
  *   not need freeing but freeing it is harmless.
  *
+ *   The one exception is regolith_iter_batch_value, which hands back a
+ *   const pointer it still owns. It is borrowed, not transferred: copy
+ *   it, do not free it, and do not keep it past the validity window in
+ *   that function's comment.
+ *
  * Ordering contracts
  *   1. Every RegolithIter derived from a RegolithTxn must be closed
  *      before that transaction is committed, discarded or freed. The
@@ -58,8 +63,13 @@
  *      buffered writes when it is first advanced, and again on each
  *      rebuild (regolith_iter_reset or regolith_iter_seek). A write
  *      buffered after the iterator was created but before its first
- *      regolith_iter_next IS visible; one buffered midway through an
- *      iteration is not, until the next rebuild.
+ *      regolith_iter_next / regolith_iter_next_batch IS visible; one
+ *      buffered midway through an iteration is not, until the next
+ *      rebuild.
+ *   4. A pointer from regolith_iter_batch_value belongs to the batch it
+ *      came from: regolith_iter_next_batch, regolith_iter_seek,
+ *      regolith_iter_reset and regolith_iter_close all invalidate it.
+ *      Reading one afterwards is undefined.
  *
  * Thread safety
  *   A RegolithDb handle may be used from multiple threads at once. A
@@ -252,6 +262,15 @@ int32_t regolith_txn_free(RegolithTxn *txn);
  * An iterator starts un-positioned with a pending reset, so the first
  * regolith_iter_next positions it on the first in-range entry rather
  * than advancing past it. This matches corekv's Iterator contract.
+ *
+ * There are two ways to walk: one entry at a time with
+ * regolith_iter_next plus regolith_iter_key / regolith_iter_value, which
+ * is three crossings per entry; or a batch of keys at a time with
+ * regolith_iter_next_batch plus regolith_iter_batch_value. The two share
+ * one cursor and may be mixed freely - the batch calls are the bulk path
+ * and the single calls the positioning path - with one difference, noted
+ * on both: after a regolith_iter_seek, regolith_iter_next advances past
+ * the entry sought while regolith_iter_next_batch includes it.
  * ------------------------------------------------------------------ */
 
 /* Advance (or, after construction/reset, position at the start of the
@@ -262,12 +281,15 @@ int32_t regolith_iter_next(RegolithIter *it, uint8_t *valid);
  * `start`, and under `reverse` a target at or above `end` becomes the top
  * of the range. Forward lands on the smallest key >= the target, reverse
  * on the greatest key <= it. Writes 0 or 1 to *valid. Clears any pending
- * reset, so a following regolith_iter_next advances from here. */
+ * reset, so a following regolith_iter_next advances from here, while a
+ * following regolith_iter_next_batch starts on the entry sought.
+ * Invalidates the current batch and its value pointers. */
 int32_t regolith_iter_seek(RegolithIter *it, const uint8_t *key,
                            size_t key_len, uint8_t *valid);
 
 /* Mark for re-iteration: the next regolith_iter_next returns to the
- * start of the range. Never fails on a live handle. */
+ * start of the range. Invalidates the current batch and its value
+ * pointers. Never fails on a live handle. */
 int32_t regolith_iter_reset(RegolithIter *it);
 
 /* Copy out the current key. REGOLITH_ERR_NOT_FOUND when the iterator is
@@ -278,6 +300,50 @@ int32_t regolith_iter_key(RegolithIter *it, uint8_t **key, size_t *key_len);
  * was created with keys_only. REGOLITH_ERR_NOT_FOUND when not
  * positioned on a valid in-range entry. */
 int32_t regolith_iter_value(RegolithIter *it, uint8_t **val, size_t *val_len);
+
+/* Advance up to `max_entries` times, framing the KEYS walked into one
+ * buffer:
+ *
+ *     [uint32_t key_len][key bytes]  repeated *out_count times
+ *
+ * little-endian, one allocation, owned by the caller and released with
+ * regolith_free_buf(*out, *out_len) like any other output buffer.
+ *
+ * The first entry of a batch follows the same positioning rule as
+ * regolith_iter_next: after construction or regolith_iter_reset the
+ * batch starts at the first in-range entry rather than advancing past
+ * it, and after regolith_iter_seek it starts at the entry the seek
+ * landed on.
+ *
+ * *out_count == 0 is the only signal that the range is exhausted. A
+ * short batch is NOT one: it also happens when the batch reaches its cap
+ * on retained value bytes (1 MiB), or when a read error is being held
+ * back so the entries already walked are not lost - that error is
+ * returned from the next call. `max_entries` must be at least 1;
+ * 0 is REGOLITH_ERR_INVALID_ARG.
+ *
+ * Values are NOT framed. The call retains one reference-counted value
+ * handle per entry instead - no copy on either the forward or the
+ * reverse path - addressable with regolith_iter_batch_value. Under
+ * keys_only nothing is retained at all. Those handles pin what owns
+ * their bytes, which is why a batch is meant to be drained promptly and
+ * why its total is capped. */
+int32_t regolith_iter_next_batch(RegolithIter *it, size_t max_entries,
+                                 uint8_t **out, size_t *out_len,
+                                 size_t *out_count);
+
+/* Borrowed pointer to value #idx of the current batch, counting from 0
+ * in the order the keys were framed. No allocation, and nothing to
+ * free.
+ *
+ * Valid until the next regolith_iter_next_batch, regolith_iter_seek,
+ * regolith_iter_reset or regolith_iter_close on this handle; see
+ * ordering contract 4. A keys_only iterator yields (NULL, 0) for every
+ * index inside the batch, matching regolith_iter_value's empty buffer.
+ * An `idx` at or beyond the last batch's *out_count is
+ * REGOLITH_ERR_INVALID_ARG. */
+int32_t regolith_iter_batch_value(RegolithIter *it, size_t idx,
+                                  const uint8_t **val, size_t *val_len);
 
 /* Close the iterator and free its handle. Exactly once per handle. */
 int32_t regolith_iter_close(RegolithIter *it);
