@@ -60,9 +60,17 @@ pub unsafe extern "C" fn regolith_db_open(
             set_error("path is not valid utf-8");
             return INVALID_ARG;
         };
-        // Defaults only. The benchmark compares engines at their
-        // defaults, so this layer does not tune anything.
-        match OptimisticTransactionDb::open(path, Options::default()) {
+        // EXPERIMENT, not for merge. transaction_keys_inline defaults to 32;
+        // past that the transaction write buffer builds a hash index over
+        // itself and clones the key on every insert, which a blind-write
+        // transaction never benefits from. Measured at 231ns per key in the
+        // Rust lane. This raises it past the benchmark's largest transaction
+        // (1000 keys) to size the end-to-end effect through the FFI.
+        let opts = Options {
+            transaction_keys_inline: 4096,
+            ..Options::default()
+        };
+        match OptimisticTransactionDb::open(path, opts) {
             Ok(db) => {
                 let handle = Box::new(RegolithDb {
                     inner: Arc::new(db),
