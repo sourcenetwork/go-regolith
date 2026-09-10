@@ -241,3 +241,97 @@ func (it *Iter) Close() error {
 
 	return statusToErr(C.regolith_iter_close(it.i))
 }
+
+// BorrowValue hands the value at the current iterator location to fn without
+// copying it, and returns fn's error unchanged.
+//
+// fn is called exactly once unless the value could not be read at all, and is
+// called with nil when there is no value to hand over: an iterator created with
+// `KeysOnly`, one not at a valid location, or an entry holding an empty value.
+// That mirrors [Iter.Value] returning nil in the same three cases.
+//
+// # Lifetime of the borrowed bytes
+//
+// The slice is a window onto memory the engine owns, not a copy.  The batch that
+// [Iter.Next] walked holds a reference-counted handle to the value behind every
+// one of its entries, and that reference is what keeps the bytes - an SSTable
+// block, or a memtable arena chunk - resident.  Nothing in Go is keeping them
+// alive, so the slice is valid for exactly as long as the batch is, and not one
+// instruction longer.
+//
+// Four things end a batch: [Iter.Next] refilling it, [Iter.Seek], [Iter.Reset]
+// and [Iter.Close].  For the duration of the call fn makes none of them happen
+// by itself, which is what makes the borrow safe; the caller must not make them
+// happen either.  Concretely:
+//
+//   - fn must not retain the slice, store it, or hand it to anything that will
+//     read it later.  Reading it after BorrowValue has returned is a
+//     use-after-free, silent and unchecked.  Copy the bytes - or use
+//     [Iter.AppendValue], or [Iter.Value] - if they are needed afterwards.
+//   - fn must not mutate the slice.  These are the engine's bytes, shared with
+//     whatever else is reading that block.
+//   - fn must not call back into this iterator.  [Iter.Next], [Iter.Seek],
+//     [Iter.Reset] and [Iter.Close] would each invalidate the very bytes fn is
+//     holding, from underneath it.  This is documented rather than detected:
+//     [Iter.Reset] has no way to report an error, so a guard could only cover
+//     three of the four and a guard that covers most of the hazard is worse than
+//     a stated contract, because it invites callers to rely on it.  The other
+//     corekv stores implementing this interface do not detect it either.
+//
+// Holding a batch open is not free even when used correctly - its handles pin
+// what owns their bytes - so a borrow is meant to be short.
+func (it *Iter) BorrowValue(fn func(value []byte) error) error {
+	return it.borrowValue(fn)
+}
+
+// AppendValue appends the value at the current iterator location to dst and
+// returns the extended slice, following the convention of the stdlib's Append*
+// functions.  Anything already in dst is preserved.
+//
+// This is the middle ground between [Iter.Value] and [Iter.BorrowValue]: the
+// value bytes are still copied, once, but into a buffer the caller owns and can
+// re-use across a whole iteration, so there is no allocation when dst has the
+// capacity for them.  Unlike a borrowed slice the result is the caller's to keep.
+//
+// dst is returned unchanged, and no error, when there is no value to append - an
+// iterator created with `KeysOnly`, one not at a valid location, or an entry
+// holding an empty value - mirroring [Iter.Value] returning nil.
+func (it *Iter) AppendValue(dst []byte) ([]byte, error) {
+	err := it.borrowValue(func(value []byte) error {
+		dst = append(dst, value...)
+
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return dst, nil
+}
+
+// borrowValue is the shared read path behind [Iter.BorrowValue] and
+// [Iter.AppendValue]: it resolves the current entry's value to a slice over the
+// engine's own memory and calls fn with it, returning fn's error untouched.
+//
+// The slice is built with [unsafe.Slice] rather than [C.GoBytes] precisely
+// because a copy is what is being avoided; see [Iter.BorrowValue] for what keeps
+// that memory alive and what the caller must not do with it.
+func (it *Iter) borrowValue(fn func(value []byte) error) error {
+	if it.keysOnly || it.pos < 0 || it.pos >= len(it.ents) {
+		return fn(nil)
+	}
+
+	// Borrowed, not owned: the FFI layer is holding a reference to these bytes
+	// on behalf of the current batch, so there is nothing to free.
+	status := C.regolith_iter_batch_value(it.i, C.size_t(it.pos), &it.val, &it.valLen)
+	if err := statusToErr(status); err != nil {
+		return err
+	}
+	if it.valLen == 0 {
+		// An empty value has no owner to point at, and the FFI layer yields a nil
+		// pointer for it, which is not something to build a slice over.
+		return fn(nil)
+	}
+
+	return fn(unsafe.Slice((*byte)(unsafe.Pointer(it.val)), int(it.valLen)))
+}
