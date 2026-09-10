@@ -47,10 +47,32 @@
  *   passing back exactly the pair it received. A zero-length output does
  *   not need freeing but freeing it is harmless.
  *
- *   The one exception is regolith_iter_batch_value, which hands back a
- *   const pointer it still owns. It is borrowed, not transferred: copy
- *   it, do not free it, and do not keep it past the validity window in
- *   that function's comment.
+ * Borrowed output bytes
+ *   Three calls hand back a const pointer into memory the engine already
+ *   owns, rather than transferring an allocation: regolith_iter_batch_value,
+ *   regolith_db_get_borrowed and regolith_txn_get_borrowed. In every case the
+ *   bytes are borrowed, not given: copy them, never pass them to
+ *   regolith_free_buf, and do not keep the pointer past its validity window.
+ *
+ *   regolith_iter_batch_value carries no handle. Its bytes belong to the
+ *   current batch and stay valid for exactly as long as that batch does; see
+ *   the validity window in that function's comment.
+ *
+ *   The two point reads hand back an opaque RegolithValue handle alongside
+ *   the pointer, holding the reference count that keeps the memory valid.
+ *   The pointer is valid from the call returning REGOLITH_OK until
+ *   regolith_release_value is called on the handle, and not one instruction
+ *   longer. The caller must always release it, on every path including
+ *   failing ones, and should do it in the same call that copies the bytes -
+ *   a handle pins what owns the value, so one held on keeps an SSTable block
+ *   or a memtable arena chunk resident no matter what the engine would
+ *   rather do with it.
+ *
+ *   Two cases produce no handle, and NULL is exactly what
+ *   regolith_release_value expects, so the caller needs only one
+ *   unconditional release: REGOLITH_ERR_NOT_FOUND, which writes no
+ *   out-param at all, and a present-but-zero-length value, which is
+ *   REGOLITH_OK with (NULL, 0) because an empty value has no owner to pin.
  *
  * Ordering contracts
  *   1. Every RegolithIter derived from a RegolithTxn must be closed
@@ -58,7 +80,7 @@
  *      iterator reads at the transaction's snapshot sequence, and the
  *      transaction holds the pin keeping that sequence alive.
  *   2. Every RegolithTxn and RegolithIter must be closed/freed before
- *      regolith_db_close.
+ *      regolith_db_close, and every RegolithValue released before it.
  *   3. A RegolithIter over a transaction materialises that transaction's
  *      buffered writes when it is first advanced, and again on each
  *      rebuild (regolith_iter_reset or regolith_iter_seek). A write
@@ -76,7 +98,8 @@
  *   RegolithTxn handle may be read and written from multiple threads at
  *   once, but commit/discard/free must not race with anything else on it.
  *   A RegolithIter handle is not thread-safe; use it from one thread at a
- *   time.
+ *   time. A RegolithValue is read-only bytes plus an atomic refcount, so
+ *   it may be read from any thread, but release it exactly once.
  */
 
 #ifndef REGOLITH_FFI_H
@@ -118,6 +141,11 @@ extern "C" {
 typedef struct RegolithDb RegolithDb;
 typedef struct RegolithTxn RegolithTxn;
 typedef struct RegolithIter RegolithIter;
+
+/* A borrowed value's keep-alive. It owns no bytes of its own: it holds the
+ * reference count on whatever inside the engine owns them. See "Borrowed
+ * output bytes" above. */
+typedef struct RegolithValue RegolithValue;
 
 /* --------------------------------------------------------------------
  * Iteration options.
@@ -162,9 +190,15 @@ char *regolith_last_error_message(void);
 /* Release a string from regolith_last_error_message. NULL is a no-op. */
 void regolith_free_string(char *s);
 
-/* Release a buffer handed out by any get/key/value call. Pass back
- * exactly the (ptr, len) pair received. NULL or len 0 is a no-op. */
+/* Release a buffer handed out by any key/value call. Pass back exactly
+ * the (ptr, len) pair received. NULL or len 0 is a no-op. */
 void regolith_free_buf(uint8_t *ptr, size_t len);
+
+/* Release a handle from a *_get_borrowed call, unpinning the engine
+ * memory the value was read out of. The borrowed pointer that came with
+ * it must not be touched afterwards. NULL is a no-op, which is what a
+ * not-found or zero-length read produces. */
+void regolith_release_value(RegolithValue *handle);
 
 /* --------------------------------------------------------------------
  * Store.
@@ -181,10 +215,15 @@ int32_t regolith_db_open(const uint8_t *path, size_t path_len,
  * iterators must already be closed. */
 int32_t regolith_db_close(RegolithDb *db);
 
-/* Read a key. REGOLITH_ERR_NOT_FOUND when absent, with nothing
- * allocated. On REGOLITH_OK the caller owns (*val, *val_len). */
-int32_t regolith_db_get(RegolithDb *db, const uint8_t *key, size_t key_len,
-                        uint8_t **val, size_t *val_len);
+/* Read a key without copying it. On REGOLITH_OK, (*val, *val_len) is a
+ * borrowed view of bytes the engine owns and *handle keeps them alive;
+ * copy the bytes and then call regolith_release_value(*handle), always
+ * and promptly. REGOLITH_ERR_NOT_FOUND when absent, and a zero-length
+ * value yields (NULL, 0) - neither produces a handle. See "Borrowed
+ * output bytes" above for the full rule. */
+int32_t regolith_db_get_borrowed(RegolithDb *db, const uint8_t *key,
+                                 size_t key_len, const uint8_t **val,
+                                 size_t *val_len, RegolithValue **handle);
 
 /* Test for a key, writing 0 or 1 to *found. */
 int32_t regolith_db_has(RegolithDb *db, const uint8_t *key, size_t key_len,
@@ -218,9 +257,12 @@ int32_t regolith_db_txn(RegolithDb *db, uint8_t readonly, RegolithTxn **out);
  * ------------------------------------------------------------------ */
 
 /* Read a key through the transaction, seeing its own buffered writes.
- * REGOLITH_ERR_NOT_FOUND when absent. */
-int32_t regolith_txn_get(RegolithTxn *txn, const uint8_t *key, size_t key_len,
-                         uint8_t **val, size_t *val_len);
+ * Borrowed exactly as regolith_db_get_borrowed, including the obligation
+ * to release *handle; the value is independent of the transaction, so a
+ * handle stays valid across its commit or discard. */
+int32_t regolith_txn_get_borrowed(RegolithTxn *txn, const uint8_t *key,
+                                  size_t key_len, const uint8_t **val,
+                                  size_t *val_len, RegolithValue **handle);
 
 /* Test for a key through the transaction, writing 0 or 1 to *found. */
 int32_t regolith_txn_has(RegolithTxn *txn, const uint8_t *key, size_t key_len,

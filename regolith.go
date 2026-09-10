@@ -107,9 +107,14 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 
 	var val *C.uint8_t
 	var valLen C.size_t
-	status := C.regolith_db_get(db.db, bytePtr(key), C.size_t(len(key)), &val, &valLen)
+	var handle *C.RegolithValue
+	status := C.regolith_db_get_borrowed(
+		db.db,
+		bytePtr(key), C.size_t(len(key)),
+		&val, &valLen, &handle,
+	)
 
-	return takeBuf(val, valLen, status)
+	return copyBorrowed(val, valLen, handle, status)
 }
 
 // Has reports whether the given key has an entry.
@@ -295,9 +300,14 @@ func (t *Txn) Get(key []byte) ([]byte, error) {
 
 	var val *C.uint8_t
 	var valLen C.size_t
-	status := C.regolith_txn_get(t.t, bytePtr(key), C.size_t(len(key)), &val, &valLen)
+	var handle *C.RegolithValue
+	status := C.regolith_txn_get_borrowed(
+		t.t,
+		bytePtr(key), C.size_t(len(key)),
+		&val, &valLen, &handle,
+	)
 
-	return takeBuf(val, valLen, status)
+	return copyBorrowed(val, valLen, handle, status)
 }
 
 // Has reports whether the given key has an entry as the transaction sees it.
@@ -455,6 +465,39 @@ func takeBuf(ptr *C.uint8_t, length C.size_t, status C.int32_t) ([]byte, error) 
 		return nil, nil
 	}
 	defer C.regolith_free_buf(ptr, length)
+
+	return C.GoBytes(unsafe.Pointer(ptr), C.int(length)), nil
+}
+
+// copyBorrowed copies a value the FFI layer lent us into Go memory and then
+// releases the handle that was keeping it readable.
+//
+// The point of the borrowed form is that nothing is copied on the Rust side:
+// `val` points straight at the SSTable block or memtable arena chunk the engine
+// read the value out of, and `handle` holds the reference count pinning it
+// there.  The [C.GoBytes] below is the only copy in the read path.
+//
+// That pin is why the release is unconditional and why it happens here rather
+// than being handed to the caller: a handle left alive keeps a block resident
+// even after the block cache has evicted it, so holding one past the read that
+// made it leaks engine memory.  Every path releases, including the error ones.
+// A not-found read and a zero-length value both produce a nil handle, and
+// releasing nil is a no-op, so one deferred call covers every case.
+func copyBorrowed(
+	ptr *C.uint8_t,
+	length C.size_t,
+	handle *C.RegolithValue,
+	status C.int32_t,
+) ([]byte, error) {
+	defer C.regolith_release_value(handle)
+
+	if err := statusToErr(status); err != nil {
+		return nil, err
+	}
+	if length == 0 {
+		// A key holding an empty value reads back as a nil slice.
+		return nil, nil
+	}
 
 	return C.GoBytes(unsafe.Pointer(ptr), C.int(length)), nil
 }
