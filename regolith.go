@@ -489,7 +489,13 @@ func copyBorrowed(
 	handle *C.RegolithValue,
 	status C.int32_t,
 ) ([]byte, error) {
-	defer C.regolith_release_value(handle)
+	// Releasing is a boundary crossing, and the FFI produces no handle for a
+	// miss or for a present-but-empty value, so a nil check here is worth about
+	// one crossing on every one of those reads - which is most of the cost of a
+	// miss.  A nil handle is still safe to pass, this is purely the saving.
+	if handle != nil {
+		defer C.regolith_release_value(handle)
+	}
 
 	if err := statusToErr(status); err != nil {
 		return nil, err
