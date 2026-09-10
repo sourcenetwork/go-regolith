@@ -176,6 +176,76 @@ typedef struct RegolithIterOptions {
 } RegolithIterOptions;
 
 /* --------------------------------------------------------------------
+ * Engine options.
+ *
+ * A deliberately small subset of regolith's own Options: the fields with
+ * measured or plausible impact on this workload, not the whole type
+ * (which carries trait-object hooks with no C representation).
+ *
+ * Unset is not zero. Three of these fields treat 0 as a real setting -
+ * max_background_compactions 0 compacts on the calling thread,
+ * block_cache_size 0 disables the block cache, transaction_keys_inline 0
+ * never indexes a transaction's buffer - so "no opinion" cannot be
+ * spelled 0. The `present` bitmask carries which fields were actually
+ * set: a field is read only when its REGOLITH_OPT_* bit is set in it,
+ * and a zeroed struct therefore means "engine defaults, every field".
+ * Setting an unknown bit is REGOLITH_ERR_INVALID_ARG.
+ *
+ *   write_buffer_size           - memtable bytes before a flush.
+ *                                 Default 64 MB. Must be > 0.
+ *   block_cache_size            - decompressed-block cache bytes; 0
+ *                                 disables the cache. Default 512 MB.
+ *   max_background_compactions  - compaction worker threads; 0 runs
+ *                                 compaction on the calling thread.
+ *                                 Default 1.
+ *   transaction_keys_inline     - keys one transaction buffers before it
+ *                                 builds a hash index over them; 0 never
+ *                                 indexes. Default 32.
+ *   compression                 - one of the REGOLITH_COMPRESSION_*
+ *                                 values. Default LZ4.
+ *   durability                  - one of the REGOLITH_DURABILITY_*
+ *                                 values. Default Eventual.
+ *
+ * Invalid values are rejected, never clamped, and the detail message
+ * names the offending field. An unknown enum value or presence bit is
+ * refused by this layer; a value regolith itself refuses (a zero
+ * write_buffer_size, for one) comes back from its own option validation,
+ * which runs before any filesystem work, so a rejected open creates
+ * nothing.
+ *
+ * The struct contains no pointers and only needs to stay valid for the
+ * duration of the regolith_db_open_with_options call, like
+ * RegolithIterOptions.
+ * ------------------------------------------------------------------ */
+
+/* Presence bits for RegolithOptions.present. Must match src/options.rs. */
+#define REGOLITH_OPT_WRITE_BUFFER_SIZE (1ULL << 0)
+#define REGOLITH_OPT_BLOCK_CACHE_SIZE (1ULL << 1)
+#define REGOLITH_OPT_MAX_BACKGROUND_COMPACTIONS (1ULL << 2)
+#define REGOLITH_OPT_TRANSACTION_KEYS_INLINE (1ULL << 3)
+#define REGOLITH_OPT_COMPRESSION (1ULL << 4)
+#define REGOLITH_OPT_DURABILITY (1ULL << 5)
+
+/* Values for RegolithOptions.compression. */
+#define REGOLITH_COMPRESSION_NONE 0
+#define REGOLITH_COMPRESSION_SNAPPY 1
+#define REGOLITH_COMPRESSION_LZ4 2
+
+/* Values for RegolithOptions.durability. */
+#define REGOLITH_DURABILITY_IMMEDIATE 0
+#define REGOLITH_DURABILITY_EVENTUAL 1
+
+typedef struct RegolithOptions {
+  uint64_t present;
+  uint64_t write_buffer_size;
+  uint64_t block_cache_size;
+  uint64_t max_background_compactions;
+  uint64_t transaction_keys_inline;
+  uint32_t compression;
+  uint32_t durability;
+} RegolithOptions;
+
+/* --------------------------------------------------------------------
  * Utilities.
  * ------------------------------------------------------------------ */
 
@@ -204,11 +274,23 @@ void regolith_release_value(RegolithValue *handle);
  * Store.
  * ------------------------------------------------------------------ */
 
-/* Open (or create) a store. `path` must be valid UTF-8. Engine options
- * are regolith's defaults; nothing is tuned here. On REGOLITH_OK, *out
- * owns a handle to be released with regolith_db_close. */
+/* Open (or create) a store with regolith's default options. `path` must
+ * be valid UTF-8. Exactly regolith_db_open_with_options with a NULL
+ * `opts`. On REGOLITH_OK, *out owns a handle to be released with
+ * regolith_db_close. */
 int32_t regolith_db_open(const uint8_t *path, size_t path_len,
                          RegolithDb **out);
+
+/* Open (or create) a store with the engine options in `opts`. `opts` may
+ * be NULL, and a struct whose `present` mask is empty is equivalent:
+ * both mean regolith's defaults for every field. Only the fields whose
+ * presence bit is set are applied. See "Engine options" above for the
+ * unset-is-not-zero rule and for how invalid values are reported. On
+ * REGOLITH_OK, *out owns a handle to be released with
+ * regolith_db_close. */
+int32_t regolith_db_open_with_options(const uint8_t *path, size_t path_len,
+                                      const RegolithOptions *opts,
+                                      RegolithDb **out);
 
 /* Close the store and free the handle. The handle is invalid afterwards
  * even when a non-OK status is returned. All derived transactions and

@@ -24,9 +24,13 @@
 // closed before that transaction is committed or discarded, and every [Txn] and
 // [Iter] must be resolved before [DB.Close].
 //
-// regolith's own `Options` are not exposed across the FFI yet, so a store is
-// always opened with the engine defaults and [Open] takes no options parameter.
-// This is a current limitation of the FFI layer, not a design choice.
+// # Engine options
+//
+// [Open] uses regolith's defaults.  [OpenWith] takes an [Options] whose zero
+// value means exactly the same thing, and only the fields explicitly set on it
+// are applied; see [Options] for why that is not the same as "fields left at
+// zero".  Only a small subset of regolith's own `Options` is reachable so far -
+// the rest of that type is mostly trait-object hooks with no C representation.
 package regolith
 
 // #cgo CFLAGS: -I${SRCDIR}/ffi/include
@@ -78,15 +82,41 @@ type IterOptions struct {
 	KeysOnly bool
 }
 
-// Open opens (or creates) a regolith store at the given path.
+// Open opens (or creates) a regolith store at the given path, with regolith's
+// default engine options.
 //
-// There is no options parameter because regolith's `Options` are not yet
-// exposed across the FFI boundary; the engine defaults are always used.
+// It is [OpenWith] with a zero [Options].
 func Open(path string) (*DB, error) {
+	return OpenWith(path, Options{})
+}
+
+// OpenWith opens (or creates) a regolith store at the given path with the given
+// engine options.
+//
+// A zero [Options] means the engine defaults, so `OpenWith(path, Options{})` is
+// [Open].  Only the fields actually set on the options are applied; everything
+// else is left wherever regolith's defaults put it.
+//
+// An invalid setting is rejected rather than clamped, with an error naming the
+// offending field.  regolith validates its options before touching the
+// filesystem, so a rejected call creates nothing.
+func OpenWith(path string, opts Options) (*DB, error) {
 	cPath := []byte(path)
 
+	// `cOpts` is a Go value holding no Go pointers - every field is an integer -
+	// so handing C a pointer to it is legal under the cgo pointer rules without
+	// the malloc dance that `iterOptions` needs.  The FFI layer only reads it
+	// for the duration of the call.
+	cOpts, err := opts.toC()
+	if err != nil {
+		return nil, err
+	}
+
 	var db *C.RegolithDb
-	status := C.regolith_db_open(bytePtr(cPath), C.size_t(len(cPath)), &db)
+	status := C.regolith_db_open_with_options(
+		bytePtr(cPath), C.size_t(len(cPath)),
+		&cOpts, &db,
+	)
 	if err := statusToErr(status); err != nil {
 		return nil, err
 	}

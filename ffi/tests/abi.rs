@@ -1427,3 +1427,182 @@ fn batch_over_a_txn_merges_buffered_writes() {
     assert_eq!(unsafe { regolith_txn_free(txn) }, OK);
     close(db);
 }
+
+// ---------------------------------------------------------------------
+// Engine options
+//
+// The resolution of `RegolithOptions` onto regolith's own `Options` is
+// unit-tested in src/options.rs, where the resolved struct can be
+// inspected field by field. What these tests add is the other half: that
+// the ABI entry point accepts the struct, that a store opened through it
+// actually works, and that a rejected value arrives as a status with the
+// field named.
+// ---------------------------------------------------------------------
+
+/// A `RegolithOptions` with nothing set, as `calloc` or a Go zero value
+/// gives it.
+fn no_options() -> RegolithOptions {
+    RegolithOptions {
+        present: 0,
+        write_buffer_size: 0,
+        block_cache_size: 0,
+        max_background_compactions: 0,
+        transaction_keys_inline: 0,
+        compression: 0,
+        durability: 0,
+    }
+}
+
+/// `regolith_db_open_with_options`, returning either the handle or the
+/// status that refused it.
+fn open_with(dir: &TempDir, opts: *const RegolithOptions) -> Result<*mut RegolithDb, i32> {
+    let path = dir.path().to_str().unwrap().as_bytes();
+    let mut db: *mut RegolithDb = ptr::null_mut();
+    let status = unsafe {
+        regolith_db_open_with_options(path.as_ptr(), path.len(), opts, &raw mut db)
+    };
+    if status == OK {
+        assert!(!db.is_null());
+        Ok(db)
+    } else {
+        assert!(db.is_null());
+        Err(status)
+    }
+}
+
+/// Open with `opts`, exercise the store through a transaction, and close
+/// it. Every option below has to survive this. `label` names the setting
+/// under test so a failure says which one broke.
+fn assert_store_works(dir: &TempDir, opts: &RegolithOptions, label: &str) {
+    let db = open_with(dir, opts).unwrap_or_else(|status| {
+        panic!("open with {label} failed: {status} {:?}", last_error())
+    });
+
+    set(db, b"k", b"v");
+    assert_eq!(get(db, b"k").unwrap(), b"v");
+
+    let txn = begin(db, false);
+    assert_eq!(txn_set(txn, b"t", b"tv"), OK);
+    assert_eq!(unsafe { regolith_txn_commit(txn) }, OK);
+    assert_eq!(unsafe { regolith_txn_free(txn) }, OK);
+    assert_eq!(get(db, b"t").unwrap(), b"tv");
+
+    close(db);
+}
+
+#[test]
+fn open_with_null_options_is_the_defaults_path() {
+    let dir = TempDir::new().unwrap();
+    let db = open_with(&dir, ptr::null()).unwrap();
+    set(db, b"k", b"v");
+    close(db);
+
+    // And the store it produced is the same one `regolith_db_open` would
+    // have produced: re-opening it the old way reads the same bytes.
+    let db = open(&dir);
+    assert_eq!(get(db, b"k").unwrap(), b"v");
+    close(db);
+}
+
+#[test]
+fn open_with_a_zeroed_struct_is_the_defaults_path() {
+    let dir = TempDir::new().unwrap();
+    let opts = no_options();
+    let db = open_with(&dir, &raw const opts).unwrap();
+    set(db, b"k", b"v");
+    close(db);
+
+    let db = open(&dir);
+    assert_eq!(get(db, b"k").unwrap(), b"v");
+    close(db);
+}
+
+#[test]
+fn every_exposed_field_round_trips_into_a_working_store() {
+    for (bit, field, value) in [
+        (OPT_WRITE_BUFFER_SIZE, "write_buffer_size", 1024 * 1024),
+        (OPT_BLOCK_CACHE_SIZE, "block_cache_size", 2 * 1024 * 1024),
+        (OPT_MAX_BACKGROUND_COMPACTIONS, "max_background_compactions", 2),
+        (OPT_TRANSACTION_KEYS_INLINE, "transaction_keys_inline", 128),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let mut opts = no_options();
+        opts.present = bit;
+        opts.write_buffer_size = value;
+        opts.block_cache_size = value;
+        opts.max_background_compactions = value;
+        opts.transaction_keys_inline = value;
+        assert_store_works(&dir, &opts, field);
+    }
+
+    for codec in [COMPRESSION_NONE, COMPRESSION_SNAPPY, COMPRESSION_LZ4] {
+        let dir = TempDir::new().unwrap();
+        let mut opts = no_options();
+        opts.present = OPT_COMPRESSION;
+        opts.compression = codec;
+        assert_store_works(&dir, &opts, &format!("compression {codec}"));
+    }
+
+    for mode in [DURABILITY_IMMEDIATE, DURABILITY_EVENTUAL] {
+        let dir = TempDir::new().unwrap();
+        let mut opts = no_options();
+        opts.present = OPT_DURABILITY;
+        opts.durability = mode;
+        assert_store_works(&dir, &opts, &format!("durability {mode}"));
+    }
+}
+
+#[test]
+fn zero_background_compactions_is_accepted_and_is_not_unset() {
+    // The case a zero-means-default scheme would have made unreachable:
+    // no background worker, compaction on the calling thread. It has to
+    // open, and it has to survive enough writes to flush.
+    let dir = TempDir::new().unwrap();
+    let mut opts = no_options();
+    opts.present = OPT_MAX_BACKGROUND_COMPACTIONS | OPT_WRITE_BUFFER_SIZE;
+    opts.max_background_compactions = 0;
+    // Small enough that the writes below rotate the memtable, so the
+    // calling-thread compaction path is actually entered.
+    opts.write_buffer_size = 64 * 1024;
+
+    let db = open_with(&dir, &raw const opts).expect("open failed");
+    let value = vec![b'x'; 4096];
+    for i in 0..64u32 {
+        set(db, format!("key-{i:04}").as_bytes(), &value);
+    }
+    assert_eq!(get(db, b"key-0000").unwrap(), value);
+    close(db);
+}
+
+#[test]
+fn a_value_regolith_refuses_is_rejected_with_the_field_named() {
+    // `write_buffer_size` must be greater than zero. Setting the bit with
+    // a zero value reaches `Options::validate`, which refuses it before
+    // any filesystem work - so nothing is created and nothing is clamped.
+    let dir = TempDir::new().unwrap();
+    let mut opts = no_options();
+    opts.present = OPT_WRITE_BUFFER_SIZE;
+    opts.write_buffer_size = 0;
+
+    assert_eq!(open_with(&dir, &raw const opts), Err(INVALID_ARG));
+    let message = last_error().expect("a detail message");
+    assert!(
+        message.contains("write_buffer_size"),
+        "message does not name the field: {message}"
+    );
+}
+
+#[test]
+fn an_unknown_enum_discriminant_is_rejected_with_the_field_named() {
+    let dir = TempDir::new().unwrap();
+    let mut opts = no_options();
+    opts.present = OPT_COMPRESSION;
+    opts.compression = 99;
+
+    assert_eq!(open_with(&dir, &raw const opts), Err(INVALID_ARG));
+    let message = last_error().expect("a detail message");
+    assert!(
+        message.contains("compression"),
+        "message does not name the field: {message}"
+    );
+}

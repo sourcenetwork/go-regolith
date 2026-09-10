@@ -35,10 +35,12 @@ use regolith::DbSlice;
 
 mod db;
 mod iter;
+mod options;
 mod txn;
 
 pub use db::*;
 pub use iter::*;
+pub use options::*;
 pub use txn::*;
 
 // ---------------------------------------------------------------------
@@ -332,4 +334,25 @@ pub unsafe extern "C" fn regolith_free_buf(ptr: *mut u8, len: usize) {
         return;
     }
     drop(unsafe { Box::from_raw(std::slice::from_raw_parts_mut(ptr, len)) });
+}
+
+// ---------------------------------------------------------------------
+// Test helpers.
+// ---------------------------------------------------------------------
+
+#[cfg(test)]
+pub(crate) mod tests {
+    /// Take the calling thread's last error detail, exactly as a C caller
+    /// would: read it, then free it.
+    pub(crate) fn last_error() -> Option<String> {
+        let raw = super::regolith_last_error_message();
+        if raw.is_null() {
+            return None;
+        }
+        let message = unsafe { std::ffi::CStr::from_ptr(raw) }
+            .to_string_lossy()
+            .into_owned();
+        unsafe { super::regolith_free_string(raw) };
+        Some(message)
+    }
 }

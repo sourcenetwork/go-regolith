@@ -109,6 +109,28 @@ func main() {
 }
 ```
 
+## Engine options
+
+`Open` uses regolith's defaults. `OpenWith` takes an `Options`, whose zero value
+means the same thing:
+
+```go
+db, err := regolith.OpenWith("/tmp/my-store", regolith.Options{
+	// Size the transaction buffer's inline walk to the workload's transactions.
+	TransactionKeysInline: regolith.Uint64(8),
+	// 0 is a real setting here, not "unset": no compaction worker, compaction
+	// on the calling thread.
+	MaxBackgroundCompactions: regolith.Uint64(0),
+	Durability:               regolith.DurabilityImmediate,
+})
+```
+
+Only the fields actually set are applied, which is why the numeric ones are
+pointers: for several of these settings `0` is a different choice rather than an
+absence of one, so it cannot double as "leave it alone". An invalid value is
+rejected with an error naming the field, never clamped, and regolith validates
+before touching the filesystem, so a rejected open creates nothing.
+
 ## Handle ordering
 
 The FFI layer owns real Rust handles, and they have to be released in order:
@@ -140,8 +162,11 @@ detail string the FFI layer records.
 ## Current limitations
 
 - The build requirement above.
-- regolith's own engine `Options` are not exposed across the FFI yet, so a store
-  is always opened with the engine defaults and `Open` takes no options.
+- Only a small subset of regolith's engine `Options` crosses the FFI so far:
+  `WriteBufferSize`, `BlockCacheSize`, `MaxBackgroundCompactions`,
+  `TransactionKeysInline`, `Compression` and `Durability`. The rest of that type
+  is mostly trait-object hooks (compaction filters, merge operators, event
+  listeners, a pluggable `Env`) with no C representation.
 
 ## License
 

@@ -3,9 +3,10 @@
 
 use std::sync::Arc;
 
-use regolith::{IsolationLevel, OptimisticTransactionDb, Options};
+use regolith::{IsolationLevel, OptimisticTransactionDb};
 
 use crate::iter::{RegolithIter, RegolithIterOptions};
+use crate::options::{RegolithOptions, options_from};
 use crate::txn::{RegolithTxn, TxnInner};
 use crate::{
     INVALID_ARG, NOT_FOUND, OK, RegolithValue, guard, in_bytes, out_bool, out_borrowed, set_error,
@@ -37,7 +38,9 @@ macro_rules! db_ref {
     };
 }
 
-/// Open (or create) a store at `path`.
+/// Open (or create) a store at `path` with regolith's default options.
+///
+/// Exactly [`regolith_db_open_with_options`] with a null `opts`.
 ///
 /// # Safety
 /// `path` must be valid for `path_len` bytes; `out` must be writable.
@@ -45,6 +48,32 @@ macro_rules! db_ref {
 pub unsafe extern "C" fn regolith_db_open(
     path: *const u8,
     path_len: usize,
+    out: *mut *mut RegolithDb,
+) -> i32 {
+    unsafe { regolith_db_open_with_options(path, path_len, std::ptr::null(), out) }
+}
+
+/// Open (or create) a store at `path` with the engine options in `opts`.
+///
+/// A null `opts`, or one whose `present` mask is empty, is the defaults
+/// path. Only the fields whose presence bit is set are applied; see
+/// [`RegolithOptions`].
+///
+/// Invalid values are rejected rather than clamped. An unknown enum
+/// discriminant or presence bit is [`INVALID_ARG`] from this layer; a
+/// value regolith itself refuses comes back from its own
+/// `Options::validate`, which runs before any filesystem work. Either
+/// way the detail message names the offending field.
+///
+/// # Safety
+/// `path` must be valid for `path_len` bytes; `opts` must be null or
+/// point at a valid [`RegolithOptions`] for the duration of the call;
+/// `out` must be writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn regolith_db_open_with_options(
+    path: *const u8,
+    path_len: usize,
+    opts: *const RegolithOptions,
     out: *mut *mut RegolithDb,
 ) -> i32 {
     guard(|| {
@@ -60,9 +89,11 @@ pub unsafe extern "C" fn regolith_db_open(
             set_error("path is not valid utf-8");
             return INVALID_ARG;
         };
-        // Defaults only. The benchmark compares engines at their
-        // defaults, so this layer does not tune anything.
-        match OptimisticTransactionDb::open(path, Options::default()) {
+        let options = match unsafe { options_from(opts) } {
+            Ok(options) => options,
+            Err(status) => return status,
+        };
+        match OptimisticTransactionDb::open(path, options) {
             Ok(db) => {
                 let handle = Box::new(RegolithDb {
                     inner: Arc::new(db),
