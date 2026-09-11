@@ -1,10 +1,11 @@
-//! Store-level entry points: open/close, point reads and writes,
-//! `DropAll`, and the two handle factories (iterator, transaction).
+//! Store-level entry points: open/close, point reads, point and batch
+//! writes, `DropAll`, and the two handle factories (iterator, transaction).
 
 use std::sync::Arc;
 
 use regolith::OptimisticTransactionDb;
 
+use crate::batch;
 use crate::iter::{RegolithIter, RegolithIterOptions};
 use crate::options::{RegolithOptions, options_from};
 use crate::txn::{RegolithTxn, TxnInner};
@@ -227,6 +228,40 @@ pub unsafe extern "C" fn regolith_db_delete(
             return Err(Failure::invalid_arg("null key"));
         };
         handle.inner.db().delete(key)?;
+        Ok(())
+    })
+}
+
+/// Apply a batch of sets and deletes atomically: every op lands or none
+/// does, as one WAL record and one contiguous sequence range. There is no
+/// conflict check and no snapshot; this is `Db::write`, not a
+/// transaction, and it passes write-stall admission like a plain put.
+///
+/// `ops` is a frame of `ops_len` bytes, decoded by `crate::batch`. A
+/// zero-length frame is an empty batch and succeeds without writing. A
+/// frame that does not decode is [`INVALID_ARG`](crate::INVALID_ARG) with a
+/// detail naming the op, and nothing is written. Ops on the same key apply
+/// in frame order, so the last one wins. Key and value sizes are checked
+/// by the engine before anything is applied, so a refused batch writes
+/// nothing either.
+///
+/// # Safety
+/// `ops` must be valid for `ops_len` bytes for the duration of the call
+/// and is not retained. `err` must be null or writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn regolith_db_write(
+    db: *mut RegolithDb,
+    ops: *const u8,
+    ops_len: usize,
+    err: *mut *mut RegolithError,
+) -> i32 {
+    guard(err, || {
+        let handle = db_ref!(db);
+        let Some(frame) = (unsafe { in_bytes(ops, ops_len) }) else {
+            return Err(Failure::invalid_arg("null write batch"));
+        };
+        let batch = batch::decode(frame)?;
+        handle.inner.db().write(batch)?;
         Ok(())
     })
 }

@@ -6,8 +6,8 @@ embedded key-value engine written in Rust.
 The engine is reached through the hand-written C ABI in `ffi/`, a small Rust
 staticlib crate that wraps the `regolith` crate and is linked into your binary
 with cgo. The Go API on top of it is a plain, framework-free key-value store:
-`Get`/`Set`/`Has`/`Delete`, ordered iteration, and optimistic transactions with
-snapshot isolation.
+`Get`/`Set`/`Has`/`Delete`, ordered iteration, atomic batch writes, and
+optimistic transactions with snapshot isolation.
 
 ## Build requirement (read this first)
 
@@ -85,6 +85,16 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// A batch: many sets and deletes applied atomically in one call, with the
+	// store's durability.  Faster than a transaction for a grouped write, but
+	// nothing is validated against concurrent writers.
+	batch := regolith.NewWriteBatch(0)
+	batch.Set([]byte("b"), []byte("2"))
+	batch.Delete([]byte("a"))
+	if err := db.Write(batch); err != nil {
+		log.Fatal(err)
+	}
+
 	// Ordered iteration, over a snapshot taken when the iterator is created.
 	it, err := db.NewIter(regolith.IterOptions{Prefix: []byte("h")})
 	if err != nil {
@@ -135,6 +145,15 @@ pointers: for several of these settings `0` is a different choice rather than an
 absence of one, so it cannot double as "leave it alone". An invalid value is
 rejected with an error naming the field, never clamped, and regolith validates
 before touching the filesystem, so a rejected open creates nothing.
+
+## Batch writes
+
+`WriteBatch` collects sets and deletes with `Set` and `Delete`, and `DB.Write`
+applies them in one call: every op lands or none does, as one write-ahead log
+record, with the same durability as `Set`. There is no conflict detection and
+no snapshot - a batch is not a transaction - and ops on the same key apply in
+the order they were added, so the last one wins. Call `Reset` to reuse a
+batch, and watch `Size` to bound how much memory it holds.
 
 ## Handle ordering
 

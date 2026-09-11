@@ -13,6 +13,9 @@
 //!   dereference.
 //! * Input bytes cross as `(*const u8, usize)` and are **not retained**
 //!   past the call, so the caller may pass Go memory directly.
+//! * A batch of writes crosses as one packed frame, decoded and validated
+//!   in full before it reaches the engine; see `batch.rs` and
+//!   `regolith_db_write`.
 //! * Output bytes are allocated here; the caller copies them and then
 //!   calls [`regolith_free_buf`].
 //! * Every status-returning entry point takes a trailing `err` out-param.
@@ -38,6 +41,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use regolith::DbSlice;
 
+mod batch;
 mod db;
 mod iter;
 mod options;

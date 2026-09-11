@@ -40,7 +40,8 @@
  *   past the call: the library copies whatever it needs before returning.
  *   Passing Go memory directly is therefore legal under the cgo pointer
  *   rules. A len of 0 is an empty input regardless of the pointer, which
- *   is how a nil Go slice arrives.
+ *   is how a nil Go slice arrives. A batch of writes is one such input,
+ *   packed as the frame described at regolith_db_write.
  *
  * Output bytes
  *   Outputs are allocated by this library and handed over through
@@ -351,6 +352,25 @@ int32_t regolith_db_set(RegolithDb *db, const uint8_t *key, size_t key_len,
 /* Delete a key. Deleting an absent key is REGOLITH_OK. */
 int32_t regolith_db_delete(RegolithDb *db, const uint8_t *key, size_t key_len,
                            RegolithError **err);
+
+/* Apply a batch of sets and deletes atomically: every op lands or none
+ * does, as one WAL record and one contiguous sequence range, with the
+ * store's durability mode. No conflict check, no snapshot: this is the
+ * engine's native batch write, not a transaction.
+ *
+ * `ops` is a frame of `ops_len` bytes, a sequence of
+ *
+ *   set:    [uint8_t 1][uint64_t key_len][key][uint64_t value_len][value]
+ *   delete: [uint8_t 2][uint64_t key_len][key]
+ *
+ * lengths little-endian, repeated until the buffer ends. Zero bytes is an
+ * empty batch and REGOLITH_OK. A frame that does not decode (unknown tag,
+ * a length past the end) is REGOLITH_ERR_INVALID_ARG naming the op, and
+ * nothing is written; so is a key or value over the engine's size limit,
+ * checked over the whole batch before any op is applied. Ops on one key
+ * apply in frame order, last one wins. The frame is not retained. */
+int32_t regolith_db_write(RegolithDb *db, const uint8_t *ops, size_t ops_len,
+                          RegolithError **err);
 
 /* Delete every entry in the store (corekv.Dropable.DropAll). */
 int32_t regolith_db_drop_all(RegolithDb *db, RegolithError **err);

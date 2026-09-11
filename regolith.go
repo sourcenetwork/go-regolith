@@ -14,10 +14,12 @@
 // # Usage
 //
 // Open a store with [Open], read and write through [DB], iterate with
-// [DB.NewIter], and group writes with [DB.NewTxn].  Transactions are optimistic
-// with snapshot isolation by default, so a commit that lost a validation race
-// returns [ErrConflict] and should be retried from a new transaction.  A store
-// opened with [OpenWith] can choose another level; see [Options.Isolation].
+// [DB.NewIter], and group writes with [DB.NewTxn] or apply many at once with
+// [DB.Write] and a [WriteBatch], which is atomic but not a transaction.
+// Transactions are optimistic with snapshot isolation by default, so a commit
+// that lost a validation race returns [ErrConflict] and should be retried
+// from a new transaction.  A store opened with [OpenWith] can choose another
+// level; see [Options.Isolation].
 //
 // # Limitations
 //
@@ -63,6 +65,8 @@ package regolith
 // #cgo nocallback regolith_db_set
 // #cgo noescape regolith_db_txn
 // #cgo nocallback regolith_db_txn
+// #cgo noescape regolith_db_write
+// #cgo nocallback regolith_db_write
 // #cgo noescape regolith_error_free
 // #cgo nocallback regolith_error_free
 // #cgo noescape regolith_error_message
@@ -259,6 +263,29 @@ func (db *DB) Delete(key []byte) error {
 
 	var cerr *C.RegolithError
 	status := C.regolith_db_delete(db.db, bytePtr(key), C.size_t(len(key)), &cerr)
+
+	return statusToErr(status, cerr)
+}
+
+// Write applies the batch atomically: every op lands or none does, with the
+// store's durability, in one crossing of the FFI boundary.  It does not
+// validate against concurrent writers; see [WriteBatch] for what a batch is
+// and is not.
+//
+// The batch is left as it was, so it can be inspected or written again; call
+// [WriteBatch.Reset] to reuse it.  A nil or empty batch writes nothing.
+func (db *DB) Write(b *WriteBatch) error {
+	db.closeLk.RLock()
+	defer db.closeLk.RUnlock()
+	if db.closed.Load() {
+		return ErrClosed
+	}
+	if b == nil || b.n == 0 {
+		return nil
+	}
+
+	var cerr *C.RegolithError
+	status := C.regolith_db_write(db.db, bytePtr(b.buf), C.size_t(len(b.buf)), &cerr)
 
 	return statusToErr(status, cerr)
 }

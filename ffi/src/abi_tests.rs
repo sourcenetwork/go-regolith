@@ -18,7 +18,7 @@ use tempfile::TempDir;
 // will have to do.
 // ---------------------------------------------------------------------
 
-fn open(dir: &TempDir) -> *mut RegolithDb {
+pub(crate) fn open(dir: &TempDir) -> *mut RegolithDb {
     let path = dir.path().to_str().unwrap().as_bytes();
     let mut db: *mut RegolithDb = ptr::null_mut();
     let mut err: *mut RegolithError = ptr::null_mut();
@@ -69,7 +69,7 @@ fn take_borrowed(ptr: *const u8, len: usize, handle: *mut RegolithValue) -> Vec<
     copied
 }
 
-fn get(db: *mut RegolithDb, key: &[u8]) -> Result<Vec<u8>, i32> {
+pub(crate) fn get(db: *mut RegolithDb, key: &[u8]) -> Result<Vec<u8>, i32> {
     let mut val: *const u8 = ptr::null();
     let mut len: usize = 0;
     let mut handle: *mut RegolithValue = ptr::null_mut();
@@ -97,7 +97,7 @@ fn get(db: *mut RegolithDb, key: &[u8]) -> Result<Vec<u8>, i32> {
     }
 }
 
-fn has(db: *mut RegolithDb, key: &[u8]) -> bool {
+pub(crate) fn has(db: *mut RegolithDb, key: &[u8]) -> bool {
     let mut found: u8 = 2;
     let mut err: *mut RegolithError = ptr::null_mut();
     let status =
@@ -249,13 +249,13 @@ fn keys(entries: &[(String, String)]) -> Vec<&str> {
 }
 
 /// Seed a store with `a..e` mapped to `va..ve`.
-fn seed(db: *mut RegolithDb) {
+pub(crate) fn seed(db: *mut RegolithDb) {
     for key in ["a", "b", "c", "d", "e"] {
         set(db, key.as_bytes(), format!("v{key}").as_bytes());
     }
 }
 
-fn close(db: *mut RegolithDb) {
+pub(crate) fn close(db: *mut RegolithDb) {
     let mut err: *mut RegolithError = ptr::null_mut();
     assert_eq!(
         unsafe { regolith_db_close(db, &raw mut err) },
