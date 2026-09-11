@@ -367,8 +367,11 @@ int32_t regolith_db_delete(RegolithDb *db, const uint8_t *key, size_t key_len,
  * empty batch and REGOLITH_OK. A frame that does not decode (unknown tag,
  * a length past the end) is REGOLITH_ERR_INVALID_ARG naming the op, and
  * nothing is written; so is a key or value over the engine's size limit,
- * checked over the whole batch before any op is applied. Ops on one key
- * apply in frame order, last one wins. The frame is not retained. */
+ * checked over the whole batch before any op is applied. A batch whose WAL
+ * record (the frame's bytes plus 8 per set, 12 per delete, plus 4) would
+ * exceed 1073741824 bytes is likewise REGOLITH_ERR_INVALID_ARG naming the
+ * op, and nothing is written. Ops on one key apply in frame order, last one
+ * wins. The frame is not retained. */
 int32_t regolith_db_write(RegolithDb *db, const uint8_t *ops, size_t ops_len,
                           RegolithError **err);
 

@@ -155,6 +155,14 @@ no snapshot - a batch is not a transaction - and ops on the same key apply in
 the order they were added, so the last one wins. Call `Reset` to reuse a
 batch, and watch `Size` to bound how much memory it holds.
 
+That one write-ahead log record is capped by the engine at 1073741824 bytes
+(1 GiB), and `DB.Write` rejects a batch that would cross it with
+`ErrInvalidArgument` before writing anything, rather than writing and later
+losing it on a crash and reopen. The record is not `Size`: it runs `Size`
+bytes plus 8 for every set, 12 for every delete, plus 4, so split a batch
+into smaller ones well before `Size` alone reaches 1 GiB. See
+`WriteBatch.Size` for the exact rule.
+
 ## Handle ordering
 
 The FFI layer owns real Rust handles, and they have to be released in order:

@@ -421,6 +421,60 @@ func TestWriteBatchRejectsAnOversizedKeyWithDetail(t *testing.T) {
 	}
 }
 
+// TestWriteBatchRejectsAnOversizedBatch checks that a batch whose packed ops
+// would push the engine's write-ahead-log record past its roughly 1 GiB
+// limit is rejected with ErrInvalidArgument, and that nothing in the batch
+// lands, not even an earlier op that was well within every per-op limit on
+// its own.
+//
+// The batch is built from empty-key deletes, the cheapest op the wire
+// format has for reaching that limit: each one costs the engine 21 bytes
+// (DELETE_RECORD_OVERHEAD, mirrored below from ffi/src/batch.rs) but only 9
+// in this buffer (a tag byte plus an 8-byte zero key length), so the
+// boundary is crossed with a frame of well under half a real gigabyte, and
+// the FFI decoder rejects it in a length-only sizing pass that copies no
+// key or value into a Rust batch (ffi/src/batch.rs decode).  Peak resident
+// set of the test binary running this test alone: 462,076 KB.  The exact
+// boundary is pinned on the Rust side (the boundary_batch_of_* tests in
+// ffi/src/batch.rs); this test only needs to land clearly past it.
+func TestWriteBatchRejectsAnOversizedBatch(t *testing.T) {
+	const (
+		deleteRecordOverhead = 21 // mirrors ffi/src/batch.rs DELETE_RECORD_OVERHEAD
+		maxBatchRecordLen    = 1 << 30
+		deleteFrameLen       = 9 // 1 tag byte + 8-byte (zero) key length
+		oversizedDeleteCount = maxBatchRecordLen/deleteRecordOverhead + 1000
+	)
+
+	db := newDB(t)
+
+	var wb WriteBatch
+	wb.Set([]byte("marker"), []byte("1"))
+
+	base := len(wb.buf)
+	wb.buf = append(wb.buf, make([]byte, oversizedDeleteCount*deleteFrameLen)...)
+	for i := range oversizedDeleteCount {
+		wb.buf[base+i*deleteFrameLen] = opDelete
+	}
+	wb.n += oversizedDeleteCount
+
+	if got := wb.Size(); got >= maxBatchRecordLen {
+		t.Fatalf("test batch is %d bytes, at or over the engine's 1 GiB limit; "+
+			"the point of this test is to trigger it with well under that", got)
+	}
+
+	err := db.Write(&wb)
+	if !errors.Is(err, ErrInvalidArgument) {
+		t.Fatalf("expected ErrInvalidArgument, got %v", err)
+	}
+	if want := "split it"; !strings.Contains(err.Error(), want) {
+		t.Errorf("expected detail to say what to do, got %v", err)
+	}
+
+	if _, err := db.Get([]byte("marker")); !errors.Is(err, ErrNotFound) {
+		t.Errorf("marker: expected ErrNotFound (nothing should land), got %v", err)
+	}
+}
+
 // TestWriteBatchMalformedFrameIsRejected drives the FFI decoder from the Go
 // side with a hand-built, malformed frame, checking that the Rust detail
 // crosses intact and that the store is unharmed afterwards.

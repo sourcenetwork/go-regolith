@@ -274,6 +274,11 @@ func (db *DB) Delete(key []byte) error {
 //
 // The batch is left as it was, so it can be inspected or written again; call
 // [WriteBatch.Reset] to reuse it.  A nil or empty batch writes nothing.
+//
+// A batch whose packed ops would push the engine's write-ahead log record
+// past 1073741824 bytes (1 GiB) is rejected with [ErrInvalidArgument] before
+// anything is written; see [WriteBatch.Size] for the exact rule, and split a
+// batch that large into smaller ones instead.
 func (db *DB) Write(b *WriteBatch) error {
 	db.closeLk.RLock()
 	defer db.closeLk.RUnlock()

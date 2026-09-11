@@ -25,10 +25,15 @@ const (
 //
 // A batch is applied atomically (every op or none, one write-ahead log
 // record) with the store's durability ([Options.Durability]), the same as
-// [DB.Set].  It is not a transaction: nothing is validated against concurrent
-// writers, there is no snapshot and no reads, and it cannot be discarded once
-// written.  Ops on the same key apply in the order they were added, so the
-// last one wins.
+// [DB.Set].  That single record is capped by the engine at 1073741824 bytes
+// (1 GiB); [DB.Write] rejects a batch that would cross it with
+// [ErrInvalidArgument] instead of writing it and losing it on the next crash
+// and reopen, so split a batch that large into smaller ones.  The record is
+// not [WriteBatch.Size]: see that method for the exact rule a caller can
+// compute.  It is not a transaction: nothing is validated against concurrent
+// writers, there is no snapshot and no reads, and it cannot be discarded
+// once written.  Ops on the same key apply in the order they were added, so
+// the last one wins.
 //
 // A WriteBatch is not safe for concurrent use.  Distinct batches may be
 // written concurrently.
@@ -65,6 +70,14 @@ func (b *WriteBatch) Len() int { return b.n }
 
 // Size is the number of packed bytes the batch holds, which is what its
 // memory and the cost of writing it scale with.
+//
+// Size is not the quantity [DB.Write] bounds: the write-ahead log record a
+// batch produces runs Size bytes plus 8 for every [WriteBatch.Set] and 12
+// for every [WriteBatch.Delete], plus 4 (a set frames 17+key+value bytes
+// but records 25+key+value, a delete frames 9+key but records 21+key, and
+// the record opens with a 4-byte count). DB.Write rejects the batch once
+// that total would exceed 1073741824 bytes (1 GiB), even when Size alone is
+// still under it.
 func (b *WriteBatch) Size() int { return len(b.buf) }
 
 // Reset empties the batch, keeping its buffer for reuse.

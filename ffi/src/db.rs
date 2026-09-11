@@ -243,7 +243,10 @@ pub unsafe extern "C" fn regolith_db_delete(
 /// detail naming the op, and nothing is written. Ops on the same key apply
 /// in frame order, so the last one wins. Key and value sizes are checked
 /// by the engine before anything is applied, so a refused batch writes
-/// nothing either.
+/// nothing either. Nor does a batch whose WAL record (`crate::batch`'s own
+/// accounting: the frame's bytes plus 8 per set, 12 per delete, plus 4)
+/// would exceed 1073741824 bytes; that, too, is `INVALID_ARG` naming the
+/// op, checked before any op reaches the engine.
 ///
 /// # Safety
 /// `ops` must be valid for `ops_len` bytes for the duration of the call
