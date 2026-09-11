@@ -163,11 +163,9 @@ pub unsafe extern "C" fn regolith_txn_set(
         if handle.inner.readonly {
             return READ_ONLY_TXN;
         }
-        let (Some(key), Some(value)) =
-            (unsafe { in_bytes(key, key_len) }, unsafe {
-                in_bytes(value, value_len)
-            })
-        else {
+        let (Some(key), Some(value)) = (unsafe { in_bytes(key, key_len) }, unsafe {
+            in_bytes(value, value_len)
+        }) else {
             set_error("null key or value");
             return INVALID_ARG;
         };

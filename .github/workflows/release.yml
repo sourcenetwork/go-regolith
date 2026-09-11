@@ -55,10 +55,10 @@ jobs:
       - name: Build staticlib
         run: cargo build --release --locked --target ${{ matrix.target }} --manifest-path ffi/Cargo.toml
 
-      # Strip debug information from the archive. This is roughly a third of its
-      # size, and it shrinks the consuming binary by about as much. Cargo's own
-      # `strip` profile setting cannot do it - stripping is a link-time step and
-      # a staticlib is never linked - so it has to happen here, after the build.
+      # Strip debug information from the archive. It is about half of the LTO
+      # archive (what the precompiled standard library carries; the profile
+      # cannot strip it because stripping is a link-time step and a staticlib
+      # is never linked) and a few percent of the consuming binary.
       - name: Strip
         run: |
           set -eux
