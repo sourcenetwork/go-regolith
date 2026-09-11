@@ -1,0 +1,132 @@
+name: release
+
+# Tagging vX.Y.Z here builds the FFI staticlib for every supported platform,
+# commits the archives to sourcenetwork/go-regolith-prebuilt, and tags that
+# repository with the same version. The two modules are version-locked: a
+# go-regolith tag is only usable once the matching prebuilt tag exists.
+#
+# Requires a PREBUILT_PUSH_TOKEN secret with contents:write on
+# sourcenetwork/go-regolith-prebuilt (a fine-grained PAT or a GitHub App token).
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to build, e.g. v0.1.0'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: darwin
+            goarch: arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+          - goos: darwin
+            goarch: amd64
+            runner: macos-14
+            target: x86_64-apple-darwin
+          - goos: linux
+            goarch: amd64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - goos: linux
+            goarch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build staticlib
+        run: cargo build --release --locked --target ${{ matrix.target }} --manifest-path ffi/Cargo.toml
+
+      # Strip debug information from the archive. This is roughly a third of its
+      # size, and it shrinks the consuming binary by about as much. Cargo's own
+      # `strip` profile setting cannot do it - stripping is a link-time step and
+      # a staticlib is never linked - so it has to happen here, after the build.
+      - name: Strip
+        run: |
+          set -eux
+          LIB=ffi/target/${{ matrix.target }}/release/libregolith_ffi.a
+          ls -l "$LIB"
+          if [ "$(uname -s)" = Darwin ]; then strip -S "$LIB"; else strip --strip-debug "$LIB"; fi
+          ls -l "$LIB"
+
+      - name: Verify the ABI against the built library
+        run: cargo test --release --locked --manifest-path ffi/Cargo.toml
+        # Only meaningful on a native target; a cross-built archive cannot be run here.
+        if: matrix.goarch == runner.arch || matrix.goos == 'linux'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lib-${{ matrix.goos }}_${{ matrix.goarch }}
+          path: ffi/target/${{ matrix.target }}/release/libregolith_ffi.a
+          if-no-files-found: error
+
+  publish:
+    name: publish to go-regolith-prebuilt
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve version
+        id: version
+        run: echo "value=${{ github.event.inputs.version || github.ref_name }}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout prebuilt repository
+        uses: actions/checkout@v4
+        with:
+          repository: sourcenetwork/go-regolith-prebuilt
+          token: ${{ secrets.PREBUILT_PUSH_TOKEN }}
+          path: prebuilt
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Place archives
+        run: |
+          set -euo pipefail
+          for dir in artifacts/lib-*; do
+            platform="${dir#artifacts/lib-}"
+            test -d "prebuilt/lib/$platform" || {
+              echo "prebuilt/lib/$platform does not exist; add it and its dummy.go first" >&2
+              exit 1
+            }
+            cp "$dir/libregolith_ffi.a" "prebuilt/lib/$platform/libregolith_ffi.a"
+          done
+          ls -lR prebuilt/lib
+
+      - name: Commit and tag
+        working-directory: prebuilt
+        env:
+          VERSION: ${{ steps.version.outputs.value }}
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add lib
+          if git diff --cached --quiet; then
+            echo 'archives unchanged; tagging the existing tree'
+          else
+            git commit -m "Prebuilt libraries for go-regolith $VERSION
+
+          Built from sourcenetwork/go-regolith@${{ github.sha }}."
+          fi
+          git tag -a "$VERSION" -m "go-regolith $VERSION"
+          git push origin HEAD:main
+          git push origin "$VERSION"
