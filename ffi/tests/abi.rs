@@ -49,9 +49,8 @@ fn last_error() -> Option<String> {
 }
 
 fn set(db: *mut RegolithDb, key: &[u8], value: &[u8]) {
-    let status = unsafe {
-        regolith_db_set(db, key.as_ptr(), key.len(), value.as_ptr(), value.len())
-    };
+    let status =
+        unsafe { regolith_db_set(db, key.as_ptr(), key.len(), value.as_ptr(), value.len()) };
     assert_eq!(status, OK, "set failed: {:?}", last_error());
 }
 
@@ -311,7 +310,12 @@ fn drop_all_empties_the_store() {
     seed(db);
     assert!(has(db, b"c"));
 
-    assert_eq!(unsafe { regolith_db_drop_all(db) }, OK, "{:?}", last_error());
+    assert_eq!(
+        unsafe { regolith_db_drop_all(db) },
+        OK,
+        "{:?}",
+        last_error()
+    );
 
     for key in ["a", "b", "c", "d", "e"] {
         assert_eq!(get(db, key.as_bytes()), Err(NOT_FOUND), "{key} survived");
@@ -365,7 +369,10 @@ fn borrowed_get_lends_the_value_and_takes_it_back() {
 
     let (status, val, len, handle) = get_raw(db, b"k");
     assert_eq!(status, OK, "{:?}", last_error());
-    assert!(!handle.is_null(), "a non-empty value must come with a handle");
+    assert!(
+        !handle.is_null(),
+        "a non-empty value must come with a handle"
+    );
     assert_eq!(len, 5);
     // The bytes are readable while the handle is held. This is the whole
     // point: no copy was made on the way out.
@@ -428,8 +435,11 @@ fn borrowed_get_reads_bytes_owned_by_an_sstable_block() {
     {
         let db = regolith::Db::open(dir.path(), regolith::Options::default()).unwrap();
         for i in 0..64u32 {
-            db.put(format!("key{i:04}").as_bytes(), &vec![b'a' + (i % 26) as u8; 300])
-                .unwrap();
+            db.put(
+                format!("key{i:04}").as_bytes(),
+                &vec![b'a' + (i % 26) as u8; 300],
+            )
+            .unwrap();
         }
         db.flush().unwrap();
         db.close().unwrap();
@@ -499,7 +509,10 @@ fn borrowed_get_rejects_null_out_params() {
             INVALID_ARG
         );
     }
-    assert!(handle.is_null(), "a rejected call must not hand out a handle");
+    assert!(
+        handle.is_null(),
+        "a rejected call must not hand out a handle"
+    );
 
     // A null key pointer with a non-zero length is still an argument
     // error, and the store is unharmed by any of it.
@@ -1229,7 +1242,11 @@ fn batch_matches_single_stepping_for_reverse_and_prefix() {
         let options = opts(Some(b"pre:"), None, None, false, false);
         let it = db_iter(db, &options);
         let entries = drain_batched(it, max_entries);
-        assert_eq!(keys(&entries), ["pre:1", "pre:2"], "prefix batch of {max_entries}");
+        assert_eq!(
+            keys(&entries),
+            ["pre:1", "pre:2"],
+            "prefix batch of {max_entries}"
+        );
         assert_eq!(unsafe { regolith_iter_close(it) }, OK);
 
         // Reverse and prefix together, which is where the clamping and
@@ -1237,7 +1254,11 @@ fn batch_matches_single_stepping_for_reverse_and_prefix() {
         let options = opts(Some(b"pre:"), None, None, true, false);
         let it = db_iter(db, &options);
         let entries = drain_batched(it, max_entries);
-        assert_eq!(keys(&entries), ["pre:2", "pre:1"], "reverse prefix of {max_entries}");
+        assert_eq!(
+            keys(&entries),
+            ["pre:2", "pre:1"],
+            "reverse prefix of {max_entries}"
+        );
         assert_eq!(unsafe { regolith_iter_close(it) }, OK);
     }
 
@@ -1384,7 +1405,13 @@ fn batch_values_are_addressable_by_index_and_bounded() {
     );
     assert_eq!(
         unsafe {
-            regolith_iter_next_batch(ptr::null_mut(), 8, &raw mut out, &raw mut len, &raw mut count)
+            regolith_iter_next_batch(
+                ptr::null_mut(),
+                8,
+                &raw mut out,
+                &raw mut len,
+                &raw mut count,
+            )
         },
         INVALID_ARG
     );
@@ -1459,9 +1486,8 @@ fn no_options() -> RegolithOptions {
 fn open_with(dir: &TempDir, opts: *const RegolithOptions) -> Result<*mut RegolithDb, i32> {
     let path = dir.path().to_str().unwrap().as_bytes();
     let mut db: *mut RegolithDb = ptr::null_mut();
-    let status = unsafe {
-        regolith_db_open_with_options(path.as_ptr(), path.len(), opts, &raw mut db)
-    };
+    let status =
+        unsafe { regolith_db_open_with_options(path.as_ptr(), path.len(), opts, &raw mut db) };
     if status == OK {
         assert!(!db.is_null());
         Ok(db)
@@ -1475,9 +1501,8 @@ fn open_with(dir: &TempDir, opts: *const RegolithOptions) -> Result<*mut Regolit
 /// it. Every option below has to survive this. `label` names the setting
 /// under test so a failure says which one broke.
 fn assert_store_works(dir: &TempDir, opts: &RegolithOptions, label: &str) {
-    let db = open_with(dir, opts).unwrap_or_else(|status| {
-        panic!("open with {label} failed: {status} {:?}", last_error())
-    });
+    let db = open_with(dir, opts)
+        .unwrap_or_else(|status| panic!("open with {label} failed: {status} {:?}", last_error()));
 
     set(db, b"k", b"v");
     assert_eq!(get(db, b"k").unwrap(), b"v");
@@ -1523,7 +1548,11 @@ fn every_exposed_field_round_trips_into_a_working_store() {
     for (bit, field, value) in [
         (OPT_WRITE_BUFFER_SIZE, "write_buffer_size", 1024 * 1024),
         (OPT_BLOCK_CACHE_SIZE, "block_cache_size", 2 * 1024 * 1024),
-        (OPT_MAX_BACKGROUND_COMPACTIONS, "max_background_compactions", 2),
+        (
+            OPT_MAX_BACKGROUND_COMPACTIONS,
+            "max_background_compactions",
+            2,
+        ),
         (OPT_TRANSACTION_KEYS_INLINE, "transaction_keys_inline", 128),
     ] {
         let dir = TempDir::new().unwrap();

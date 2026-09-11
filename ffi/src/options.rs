@@ -202,9 +202,7 @@ pub(crate) unsafe fn options_from(opts: *const RegolithOptions) -> Result<Resolv
             DURABILITY_IMMEDIATE => DurabilityMode::Immediate,
             DURABILITY_EVENTUAL => DurabilityMode::Eventual,
             other => {
-                set_error(format!(
-                    "invalid option `durability`: unknown mode {other}"
-                ));
+                set_error(format!("invalid option `durability`: unknown mode {other}"));
                 return Err(INVALID_ARG);
             }
         };
@@ -215,9 +213,7 @@ pub(crate) unsafe fn options_from(opts: *const RegolithOptions) -> Result<Resolv
             ISOLATION_SNAPSHOT => IsolationLevel::SnapshotIsolation,
             ISOLATION_SERIALIZABLE => IsolationLevel::Serializable,
             other => {
-                set_error(format!(
-                    "invalid option `isolation`: unknown level {other}"
-                ));
+                set_error(format!("invalid option `isolation`: unknown level {other}"));
                 return Err(INVALID_ARG);
             }
         };
