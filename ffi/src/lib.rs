@@ -333,7 +333,7 @@ pub unsafe extern "C" fn regolith_free_buf(ptr: *mut u8, len: usize) {
     if ptr.is_null() || len == 0 {
         return;
     }
-    drop(unsafe { Box::from_raw(std::slice::from_raw_parts_mut(ptr, len)) });
+    drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len)) });
 }
 
 // ---------------------------------------------------------------------

@@ -26,8 +26,8 @@
 //! so `regolith_iter_next_batch` walks up to `max_entries` at a time and
 //! frames the **keys** into one buffer. Keys are copied whatever happens
 //! - a data block stores them prefix-compressed, so the cursor
-//! reassembles each one into a buffer it owns - which is exactly why
-//! batching them is free of extra copies.
+//!   reassembles each one into a buffer it owns - which is exactly why
+//!   batching them is free of extra copies.
 //!
 //! Values are deliberately *not* framed. A batch retains one
 //! [`DbSlice`] per entry instead, which is a reference count rather than
