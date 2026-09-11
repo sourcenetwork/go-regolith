@@ -14,8 +14,12 @@
 //! * Input bytes cross as `(*const u8, usize)` and are **not retained**
 //!   past the call, so the caller may pass Go memory directly.
 //! * Output bytes are allocated here; the caller copies them and then
-//!   calls [`regolith_free_buf`]. Output strings are freed with
-//!   [`regolith_free_string`].
+//!   calls [`regolith_free_buf`].
+//! * Every status-returning entry point takes a trailing `err` out-param.
+//!   On failure it receives an owned [`RegolithError`] when the code alone
+//!   does not say what went wrong ([`INVALID_ARG`], [`PANIC`], [`OTHER`]),
+//!   null otherwise; read it with [`regolith_error_message`], free it with
+//!   [`regolith_error_free`]. Nothing is keyed on the calling thread.
 //! * Point reads are the exception: they hand back a **borrowed**
 //!   pointer into memory the engine already owns, plus a
 //!   [`RegolithValue`] handle holding the reference count that keeps it
@@ -27,8 +31,9 @@
 //! pointer helpers in this module plus one documented lifetime extension
 //! in `iter.rs`.
 
-use std::cell::RefCell;
-use std::ffi::CString;
+use std::any::Any;
+use std::borrow::Cow;
+use std::ffi::{CString, c_char};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use regolith::DbSlice;
@@ -63,73 +68,168 @@ pub const DISCARDED: i32 = 5;
 pub const INVALID_ARG: i32 = 6;
 /// A Rust panic was caught at the boundary.
 pub const PANIC: i32 = 7;
-/// Anything else; call `regolith_last_error_message` for detail.
+/// Anything else; the detail says what.
 pub const OTHER: i32 = 8;
 
 // ---------------------------------------------------------------------
-// Thread-local error detail.
+// The error detail that travels with a non-OK status.
 // ---------------------------------------------------------------------
 
-thread_local! {
-    static LAST_ERROR: RefCell<Option<CString>> = const { RefCell::new(None) };
+/// A non-OK status on its way to the caller, with the detail the code
+/// alone does not convey. Only [`INVALID_ARG`], [`PANIC`] and [`OTHER`]
+/// carry one; every other code is its own message.
+#[derive(Debug)]
+pub(crate) struct Failure {
+    pub(crate) status: i32,
+    pub(crate) detail: Option<Cow<'static, str>>,
 }
 
-/// Record a detail message for the status just returned. Only consulted
-/// by the caller for [`OTHER`], [`PANIC`] and [`TXN_CONFLICT`].
-pub(crate) fn set_error(message: impl Into<Vec<u8>>) {
-    // Interior nul bytes would truncate the message; strip them rather
-    // than losing the message entirely.
-    let mut bytes: Vec<u8> = message.into();
-    bytes.retain(|b| *b != 0);
-    let cstring = CString::new(bytes).expect("nul bytes were just removed");
-    LAST_ERROR.with(|slot| *slot.borrow_mut() = Some(cstring));
-}
-
-/// Map a regolith engine error onto a status code, recording detail.
-pub(crate) fn status_of(err: &regolith::Error) -> i32 {
-    set_error(err.to_string());
-    match err {
-        regolith::Error::Closed => DB_CLOSED,
-        regolith::Error::InvalidArgument(_) => INVALID_ARG,
-        _ => OTHER,
-    }
-}
-
-/// Map a regolith transaction error onto a status code, recording detail.
-pub(crate) fn txn_status_of(err: &regolith::TransactionError) -> i32 {
-    set_error(err.to_string());
-    match err {
-        // Both are "someone else got there first, roll back and retry",
-        // which is exactly `corekv.ErrTxnConflict`.
-        regolith::TransactionError::Conflict { .. } | regolith::TransactionError::Busy(_) => {
-            TXN_CONFLICT
+impl Failure {
+    /// A status whose code is the whole message.
+    pub(crate) const fn code(status: i32) -> Self {
+        Self {
+            status,
+            detail: None,
         }
-        regolith::TransactionError::UnsupportedRangeDelete
-        | regolith::TransactionError::NoSavepoint => INVALID_ARG,
-        regolith::TransactionError::Io(_) => OTHER,
+    }
+
+    /// [`INVALID_ARG`] with the reason.
+    pub(crate) fn invalid_arg(detail: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            status: INVALID_ARG,
+            detail: Some(detail.into()),
+        }
+    }
+
+    /// [`OTHER`] with the reason.
+    pub(crate) fn other(detail: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            status: OTHER,
+            detail: Some(detail.into()),
+        }
     }
 }
 
-/// Run `body` with panics caught. Every `extern "C"` entry point goes
-/// through this, so no unwind can reach the caller's frame.
-pub(crate) fn guard(body: impl FnOnce() -> i32) -> i32 {
+/// Map a regolith engine error onto a status, keeping the text only
+/// where the code does not already say what happened.
+impl From<regolith::Error> for Failure {
+    fn from(err: regolith::Error) -> Self {
+        match err {
+            regolith::Error::Closed => Self::code(DB_CLOSED),
+            // The engine's `Display` already prefixes "invalid argument: ",
+            // and so does the Go sentinel this becomes; keep the reason only.
+            regolith::Error::InvalidArgument(reason) => Self::invalid_arg(reason),
+            other => Self::other(other.to_string()),
+        }
+    }
+}
+
+/// Map a regolith transaction error onto a status.
+impl From<regolith::TransactionError> for Failure {
+    fn from(err: regolith::TransactionError) -> Self {
+        match err {
+            // Both are "someone else got there first, roll back and retry",
+            // which is exactly `corekv.ErrTxnConflict`. The code is the whole
+            // message: nothing reads a conflict's text, and formatting it
+            // would Debug-print the key on every lost race.
+            regolith::TransactionError::Conflict { .. } | regolith::TransactionError::Busy(_) => {
+                Self::code(TXN_CONFLICT)
+            }
+            regolith::TransactionError::UnsupportedRangeDelete
+            | regolith::TransactionError::NoSavepoint => Self::invalid_arg(err.to_string()),
+            regolith::TransactionError::Io(_) => Self::other(err.to_string()),
+        }
+    }
+}
+
+/// The text of a caught panic payload, for the [`PANIC`] detail.
+fn panic_detail(payload: Box<dyn Any + Send>) -> Cow<'static, str> {
+    // `&'static str` from `panic!("literal")`, `String` from a formatted
+    // one; anything else has no text to give.
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        Cow::Borrowed(*s)
+    } else {
+        match payload.downcast::<String>() {
+            Ok(s) => Cow::Owned(*s),
+            Err(_) => Cow::Borrowed("unknown panic"),
+        }
+    }
+}
+
+/// Opaque error detail, handed to the caller through an entry point's
+/// `err` out-param. The caller owns it from that moment until
+/// `regolith_error_free`; the message is immutable, so it may be read
+/// from any thread, but it must be freed exactly once.
+pub struct RegolithError {
+    message: CString,
+}
+
+impl RegolithError {
+    /// Box `detail` for the caller. Interior nul bytes would truncate the
+    /// message, so they are stripped rather than losing it entirely.
+    fn into_raw(detail: Cow<'static, str>) -> *mut RegolithError {
+        let mut bytes = detail.into_owned().into_bytes();
+        bytes.retain(|b| *b != 0);
+        // Cannot fail: the nul bytes were just removed. `unwrap_or_default`
+        // keeps the impossible case a silent empty message, not a panic.
+        let message = CString::new(bytes).unwrap_or_default();
+        Box::into_raw(Box::new(RegolithError { message }))
+    }
+}
+
+/// The detail's message, borrowed from the object and valid until
+/// [`regolith_error_free`]. Null for a null object.
+///
+/// # Safety
+/// `err` must be null or an object from an entry point's `err` out-param
+/// that has not been freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn regolith_error_message(err: *const RegolithError) -> *const c_char {
+    match unsafe { err.as_ref() } {
+        Some(err) => err.message.as_ptr(),
+        None => std::ptr::null(),
+    }
+}
+
+/// Release a detail object. Null is a no-op.
+///
+/// # Safety
+/// `err` must be null or an object not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn regolith_error_free(err: *mut RegolithError) {
+    if err.is_null() {
+        return;
+    }
+    drop(unsafe { Box::from_raw(err) });
+}
+
+/// Run `body` with panics caught and hand its outcome to the caller: the
+/// status is returned, and the detail, if there is one, is boxed into
+/// `*err`. Every `extern "C"` entry point goes through this, so no unwind
+/// can reach the caller's frame and there is exactly one place that turns
+/// a [`Failure`] into what C sees.
+///
+/// `*err` is written exactly once when `err` is non-null, before the
+/// return: null unless the failure carries detail, so the caller need
+/// not initialise the slot. A null `err` discards the detail.
+pub(crate) fn guard(
+    err: *mut *mut RegolithError,
+    body: impl FnOnce() -> Result<(), Failure>,
+) -> i32 {
     // `AssertUnwindSafe`: a caught panic leaves the handles reachable but
     // possibly mid-update. We return a distinct status and the caller's
     // contract is to abandon the handle, so no torn state is observed.
-    match catch_unwind(AssertUnwindSafe(body)) {
-        Ok(status) => status,
-        Err(payload) => {
-            let detail = if let Some(s) = payload.downcast_ref::<&str>() {
-                (*s).to_string()
-            } else if let Some(s) = payload.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "unknown panic".to_string()
-            };
-            set_error(format!("panic in regolith-ffi: {detail}"));
-            PANIC
-        }
+    let (status, detail) = match catch_unwind(AssertUnwindSafe(body)) {
+        Ok(Ok(())) => (OK, None),
+        Ok(Err(Failure { status, detail })) => (status, detail),
+        Err(payload) => (PANIC, Some(panic_detail(payload))),
+    };
+    if !err.is_null() {
+        // SAFETY: non-null was just checked; validity for a write is the
+        // entry point's `# Safety` contract on its `err` argument.
+        unsafe { *err = detail.map_or(std::ptr::null_mut(), RegolithError::into_raw) };
     }
+    status
 }
 
 // ---------------------------------------------------------------------
@@ -169,10 +269,13 @@ pub(crate) unsafe fn in_opt_bytes<'a>(ptr: *const u8, len: usize) -> Option<&'a 
 ///
 /// # Safety
 /// `out_ptr` and `out_len` must be valid writable pointers.
-pub(crate) unsafe fn out_bytes(bytes: Vec<u8>, out_ptr: *mut *mut u8, out_len: *mut usize) -> i32 {
+pub(crate) unsafe fn out_bytes(
+    bytes: Vec<u8>,
+    out_ptr: *mut *mut u8,
+    out_len: *mut usize,
+) -> Result<(), Failure> {
     if out_ptr.is_null() || out_len.is_null() {
-        set_error("null out-param");
-        return INVALID_ARG;
+        return Err(Failure::invalid_arg("null out-param"));
     }
     // `into_boxed_slice` makes capacity == len, which is what
     // `regolith_free_buf` reconstructs.
@@ -183,7 +286,7 @@ pub(crate) unsafe fn out_bytes(bytes: Vec<u8>, out_ptr: *mut *mut u8, out_len: *
         *out_ptr = ptr;
         *out_len = len;
     }
-    OK
+    Ok(())
 }
 
 /// Opaque handle keeping a borrowed value's bytes alive.
@@ -219,12 +322,11 @@ pub(crate) unsafe fn out_borrowed(
     out_ptr: *mut *const u8,
     out_len: *mut usize,
     out_handle: *mut *mut RegolithValue,
-) -> i32 {
+) -> Result<(), Failure> {
     if out_ptr.is_null() || out_len.is_null() || out_handle.is_null() {
-        set_error("null out-param");
         // `slice` drops here, so a rejected call releases the pin it was
         // handed rather than stranding it.
-        return INVALID_ARG;
+        return Err(Failure::invalid_arg("null out-param"));
     }
     if slice.is_empty() {
         unsafe {
@@ -232,7 +334,7 @@ pub(crate) unsafe fn out_borrowed(
             *out_len = 0;
             *out_handle = std::ptr::null_mut();
         }
-        return OK;
+        return Ok(());
     }
     // Read the view out before boxing: the bytes live in the engine, not
     // in the `DbSlice`, so moving the slice into the box does not move
@@ -244,20 +346,19 @@ pub(crate) unsafe fn out_borrowed(
         *out_len = len;
         *out_handle = Box::into_raw(Box::new(RegolithValue { slice }));
     }
-    OK
+    Ok(())
 }
 
 /// Write a boolean out-param as 0/1.
 ///
 /// # Safety
 /// `out` must be null or a valid writable pointer.
-pub(crate) unsafe fn out_bool(value: bool, out: *mut u8) -> i32 {
+pub(crate) unsafe fn out_bool(value: bool, out: *mut u8) -> Result<(), Failure> {
     if out.is_null() {
-        set_error("null out-param");
-        return INVALID_ARG;
+        return Err(Failure::invalid_arg("null out-param"));
     }
     unsafe { *out = u8::from(value) };
-    OK
+    Ok(())
 }
 
 // ---------------------------------------------------------------------
@@ -271,32 +372,6 @@ pub extern "C" fn regolith_noop() {
     // `black_box` stops the optimiser from deciding this call has no
     // observable effect and eliding it at the call site.
     std::hint::black_box(());
-}
-
-/// Return the calling thread's last error detail as a freshly allocated
-/// C string, or null if there is none. Free it with
-/// [`regolith_free_string`].
-#[unsafe(no_mangle)]
-pub extern "C" fn regolith_last_error_message() -> *mut std::ffi::c_char {
-    // Deliberately not wrapped in `guard`: it returns a pointer, not a
-    // status. Nothing here can panic other than allocation failure.
-    LAST_ERROR.with(|slot| match slot.borrow().as_ref() {
-        Some(message) => message.clone().into_raw(),
-        None => std::ptr::null_mut(),
-    })
-}
-
-/// Free a string returned by [`regolith_last_error_message`].
-///
-/// # Safety
-/// `s` must be null or a pointer previously returned by
-/// [`regolith_last_error_message`], and must not be freed twice.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn regolith_free_string(s: *mut std::ffi::c_char) {
-    if s.is_null() {
-        return;
-    }
-    drop(unsafe { CString::from_raw(s) });
 }
 
 /// Release a value handle from a `_get_borrowed` call, dropping the
@@ -317,9 +392,9 @@ pub unsafe extern "C" fn regolith_release_value(handle: *mut RegolithValue) {
     // That is engine code, so it gets the same no-unwind treatment as
     // the rest of the boundary. The status is discarded because the C
     // signature has nowhere to put it.
-    let _ = guard(|| {
+    let _ = guard(std::ptr::null_mut(), || {
         drop(unsafe { Box::from_raw(handle) });
-        OK
+        Ok(())
     });
 }
 
@@ -342,18 +417,93 @@ pub unsafe extern "C" fn regolith_free_buf(ptr: *mut u8, len: usize) {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    /// Take the calling thread's last error detail, exactly as a C caller
-    /// would: read it, then free it.
-    pub(crate) fn last_error() -> Option<String> {
-        let raw = super::regolith_last_error_message();
-        if raw.is_null() {
+    use std::ptr;
+
+    use super::*;
+
+    /// Take the detail an entry point handed back, exactly as a C caller
+    /// would: read the message, then free the object. `None` when the
+    /// call left the out-param null.
+    pub(crate) fn take_error(err: *mut RegolithError) -> Option<String> {
+        if err.is_null() {
             return None;
         }
-        let message = unsafe { std::ffi::CStr::from_ptr(raw) }
+        let message = unsafe { std::ffi::CStr::from_ptr(regolith_error_message(err)) }
             .to_string_lossy()
             .into_owned();
-        unsafe { super::regolith_free_string(raw) };
+        unsafe { regolith_error_free(err) };
         Some(message)
+    }
+
+    #[test]
+    fn guard_writes_null_on_success() {
+        let mut err: *mut RegolithError = ptr::dangling_mut();
+        let status = guard(&raw mut err, || Ok(()));
+        assert_eq!(status, OK);
+        assert!(err.is_null());
+    }
+
+    #[test]
+    fn guard_writes_null_for_a_bare_code() {
+        let mut err: *mut RegolithError = ptr::dangling_mut();
+        let status = guard(&raw mut err, || Err(Failure::code(NOT_FOUND)));
+        assert_eq!(status, NOT_FOUND);
+        assert!(err.is_null());
+    }
+
+    #[test]
+    fn guard_hands_back_invalid_argument_detail() {
+        let mut err: *mut RegolithError = ptr::null_mut();
+        let status = guard(&raw mut err, || Err(Failure::invalid_arg("null key")));
+        assert_eq!(status, INVALID_ARG);
+        assert_eq!(take_error(err), Some("null key".to_string()));
+    }
+
+    #[test]
+    fn guard_hands_back_a_panic_with_its_message() {
+        let mut err: *mut RegolithError = ptr::null_mut();
+        let status = guard(&raw mut err, || panic!("boom"));
+        assert_eq!(status, PANIC);
+        assert_eq!(take_error(err), Some("boom".to_string()));
+
+        let mut err: *mut RegolithError = ptr::null_mut();
+        let status = guard(&raw mut err, || panic!("boom {}", 7));
+        assert_eq!(status, PANIC);
+        assert_eq!(take_error(err), Some("boom 7".to_string()));
+
+        let mut err: *mut RegolithError = ptr::null_mut();
+        let status = guard(&raw mut err, || std::panic::panic_any(7u8));
+        assert_eq!(status, PANIC);
+        assert_eq!(take_error(err), Some("unknown panic".to_string()));
+    }
+
+    #[test]
+    fn guard_discards_detail_for_a_null_out_param() {
+        let status = guard(ptr::null_mut(), || Err(Failure::invalid_arg("x")));
+        assert_eq!(status, INVALID_ARG);
+    }
+
+    #[test]
+    fn detail_message_round_trips_with_interior_nuls_stripped() {
+        for (input, want) in [
+            ("a\0b", "ab"),
+            ("", ""),
+            ("cl\u{e9} \u{1F600}", "cl\u{e9} \u{1F600}"),
+            ("\0\0", ""),
+        ] {
+            let raw = RegolithError::into_raw(Cow::Owned(input.to_string()));
+            let message = unsafe { std::ffi::CStr::from_ptr(regolith_error_message(raw)) }
+                .to_str()
+                .unwrap();
+            assert_eq!(message, want, "input {input:?}");
+            unsafe { regolith_error_free(raw) };
+        }
+    }
+
+    #[test]
+    fn error_message_and_free_accept_null() {
+        assert!(unsafe { regolith_error_message(ptr::null()) }.is_null());
+        unsafe { regolith_error_free(ptr::null_mut()) };
     }
 }
 

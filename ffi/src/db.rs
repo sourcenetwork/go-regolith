@@ -9,8 +9,7 @@ use crate::iter::{RegolithIter, RegolithIterOptions};
 use crate::options::{RegolithOptions, options_from};
 use crate::txn::{RegolithTxn, TxnInner};
 use crate::{
-    INVALID_ARG, NOT_FOUND, OK, RegolithValue, guard, in_bytes, out_bool, out_borrowed, set_error,
-    status_of,
+    Failure, NOT_FOUND, RegolithError, RegolithValue, guard, in_bytes, out_bool, out_borrowed,
 };
 
 /// Opaque store handle.
@@ -34,10 +33,7 @@ macro_rules! db_ref {
     ($ptr:expr) => {
         match unsafe { $ptr.as_ref() } {
             Some(db) => db,
-            None => {
-                set_error("null db handle");
-                return INVALID_ARG;
-            }
+            None => return Err(Failure::invalid_arg("null db handle")),
         }
     };
 }
@@ -47,14 +43,16 @@ macro_rules! db_ref {
 /// Exactly [`regolith_db_open_with_options`] with a null `opts`.
 ///
 /// # Safety
-/// `path` must be valid for `path_len` bytes; `out` must be writable.
+/// `path` must be valid for `path_len` bytes; `out` must be writable;
+/// `err` must be null or writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn regolith_db_open(
     path: *const u8,
     path_len: usize,
     out: *mut *mut RegolithDb,
+    err: *mut *mut RegolithError,
 ) -> i32 {
-    unsafe { regolith_db_open_with_options(path, path_len, std::ptr::null(), out) }
+    unsafe { regolith_db_open_with_options(path, path_len, std::ptr::null(), out, err) }
 }
 
 /// Open (or create) a store at `path` with the engine options in `opts`.
@@ -64,7 +62,7 @@ pub unsafe extern "C" fn regolith_db_open(
 /// [`RegolithOptions`].
 ///
 /// Invalid values are rejected rather than clamped. An unknown enum
-/// discriminant or presence bit is [`INVALID_ARG`] from this layer; a
+/// discriminant or presence bit is [`INVALID_ARG`](crate::INVALID_ARG) from this layer; a
 /// value regolith itself refuses comes back from its own
 /// `Options::validate`, which runs before any filesystem work. Either
 /// way the detail message names the offending field.
@@ -72,43 +70,33 @@ pub unsafe extern "C" fn regolith_db_open(
 /// # Safety
 /// `path` must be valid for `path_len` bytes; `opts` must be null or
 /// point at a valid [`RegolithOptions`] for the duration of the call;
-/// `out` must be writable.
+/// `out` must be writable; `err` must be null or writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn regolith_db_open_with_options(
     path: *const u8,
     path_len: usize,
     opts: *const RegolithOptions,
     out: *mut *mut RegolithDb,
+    err: *mut *mut RegolithError,
 ) -> i32 {
-    guard(|| {
+    guard(err, || {
         if out.is_null() {
-            set_error("null out-param");
-            return INVALID_ARG;
+            return Err(Failure::invalid_arg("null out-param"));
         }
         let Some(bytes) = (unsafe { in_bytes(path, path_len) }) else {
-            set_error("null path");
-            return INVALID_ARG;
+            return Err(Failure::invalid_arg("null path"));
         };
         let Ok(path) = std::str::from_utf8(bytes) else {
-            set_error("path is not valid utf-8");
-            return INVALID_ARG;
+            return Err(Failure::invalid_arg("path is not valid utf-8"));
         };
-        let options = match unsafe { options_from(opts) } {
-            Ok(options) => options,
-            Err(status) => return status,
-        };
-        match OptimisticTransactionDb::open(path, options.engine)
-            .map(|db| db.with_isolation(options.isolation))
-        {
-            Ok(db) => {
-                let handle = Box::new(RegolithDb {
-                    inner: Arc::new(db),
-                });
-                unsafe { *out = Box::into_raw(handle) };
-                OK
-            }
-            Err(e) => status_of(&e),
-        }
+        let options = unsafe { options_from(opts) }?;
+        let db =
+            OptimisticTransactionDb::open(path, options.engine)?.with_isolation(options.isolation);
+        let handle = Box::new(RegolithDb {
+            inner: Arc::new(db),
+        });
+        unsafe { *out = Box::into_raw(handle) };
+        Ok(())
     })
 }
 
@@ -118,18 +106,19 @@ pub unsafe extern "C" fn regolith_db_open_with_options(
 /// # Safety
 /// `db` must be a handle from [`regolith_db_open`], not yet closed. All
 /// iterators and transactions derived from it must already be closed.
+/// `err` must be null or writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn regolith_db_close(db: *mut RegolithDb) -> i32 {
-    guard(|| {
+pub unsafe extern "C" fn regolith_db_close(
+    db: *mut RegolithDb,
+    err: *mut *mut RegolithError,
+) -> i32 {
+    guard(err, || {
         if db.is_null() {
-            set_error("null db handle");
-            return INVALID_ARG;
+            return Err(Failure::invalid_arg("null db handle"));
         }
         let handle = unsafe { Box::from_raw(db) };
-        match handle.inner.db().close() {
-            Ok(()) => OK,
-            Err(e) => status_of(&e),
-        }
+        handle.inner.db().close()?;
+        Ok(())
     })
 }
 
@@ -144,10 +133,11 @@ pub unsafe extern "C" fn regolith_db_close(db: *mut RegolithDb) -> i32 {
 /// Returns [`NOT_FOUND`] with no handle produced when absent.
 ///
 /// # Safety
-/// `key` must be valid for `key_len` bytes. On [`OK`], `(*val, *val_len)`
-/// is **borrowed**: it stays valid only until `regolith_release_value` is
-/// called on `*handle`, which the caller must always do. See
-/// [`crate::RegolithValue`] for why promptly.
+/// `key` must be valid for `key_len` bytes. On [`OK`](crate::OK),
+/// `(*val, *val_len)` is **borrowed**: it stays valid only until
+/// `regolith_release_value` is called on `*handle`, which the caller
+/// must always do. See [`crate::RegolithValue`] for why promptly. `err`
+/// must be null or writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn regolith_db_get_borrowed(
     db: *mut RegolithDb,
@@ -156,42 +146,40 @@ pub unsafe extern "C" fn regolith_db_get_borrowed(
     val: *mut *const u8,
     val_len: *mut usize,
     value_handle: *mut *mut RegolithValue,
+    err: *mut *mut RegolithError,
 ) -> i32 {
-    guard(|| {
+    guard(err, || {
         let handle = db_ref!(db);
         let Some(key) = (unsafe { in_bytes(key, key_len) }) else {
-            set_error("null key");
-            return INVALID_ARG;
+            return Err(Failure::invalid_arg("null key"));
         };
-        match handle.inner.db().get_slice(key) {
-            Ok(Some(slice)) => unsafe { out_borrowed(slice, val, val_len, value_handle) },
-            Ok(None) => NOT_FOUND,
-            Err(e) => status_of(&e),
-        }
+        let Some(slice) = handle.inner.db().get_slice(key)? else {
+            return Err(Failure::code(NOT_FOUND));
+        };
+        unsafe { out_borrowed(slice, val, val_len, value_handle) }
     })
 }
 
 /// Test for the presence of `key`, writing 0/1 to `found`.
 ///
 /// # Safety
-/// As [`regolith_db_get_borrowed`]; `found` must be writable.
+/// As [`regolith_db_get_borrowed`]; `found` must be writable; `err` must
+/// be null or writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn regolith_db_has(
     db: *mut RegolithDb,
     key: *const u8,
     key_len: usize,
     found: *mut u8,
+    err: *mut *mut RegolithError,
 ) -> i32 {
-    guard(|| {
+    guard(err, || {
         let handle = db_ref!(db);
         let Some(key) = (unsafe { in_bytes(key, key_len) }) else {
-            set_error("null key");
-            return INVALID_ARG;
+            return Err(Failure::invalid_arg("null key"));
         };
-        match handle.inner.db().has(key) {
-            Ok(found_value) => unsafe { out_bool(found_value, found) },
-            Err(e) => status_of(&e),
-        }
+        let found_value = handle.inner.db().has(key)?;
+        unsafe { out_bool(found_value, found) }
     })
 }
 
@@ -199,7 +187,7 @@ pub unsafe extern "C" fn regolith_db_has(
 ///
 /// # Safety
 /// `key` and `value` must be valid for their lengths. Neither is
-/// retained past the call.
+/// retained past the call. `err` must be null or writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn regolith_db_set(
     db: *mut RegolithDb,
@@ -207,57 +195,55 @@ pub unsafe extern "C" fn regolith_db_set(
     key_len: usize,
     value: *const u8,
     value_len: usize,
+    err: *mut *mut RegolithError,
 ) -> i32 {
-    guard(|| {
+    guard(err, || {
         let handle = db_ref!(db);
         let (Some(key), Some(value)) = (unsafe { in_bytes(key, key_len) }, unsafe {
             in_bytes(value, value_len)
         }) else {
-            set_error("null key or value");
-            return INVALID_ARG;
+            return Err(Failure::invalid_arg("null key or value"));
         };
-        match handle.inner.db().put(key, value) {
-            Ok(()) => OK,
-            Err(e) => status_of(&e),
-        }
+        handle.inner.db().put(key, value)?;
+        Ok(())
     })
 }
 
 /// Delete `key`. Deleting an absent key is not an error.
 ///
 /// # Safety
-/// `key` must be valid for `key_len` bytes.
+/// `key` must be valid for `key_len` bytes. `err` must be null or
+/// writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn regolith_db_delete(
     db: *mut RegolithDb,
     key: *const u8,
     key_len: usize,
+    err: *mut *mut RegolithError,
 ) -> i32 {
-    guard(|| {
+    guard(err, || {
         let handle = db_ref!(db);
         let Some(key) = (unsafe { in_bytes(key, key_len) }) else {
-            set_error("null key");
-            return INVALID_ARG;
+            return Err(Failure::invalid_arg("null key"));
         };
-        match handle.inner.db().delete(key) {
-            Ok(()) => OK,
-            Err(e) => status_of(&e),
-        }
+        handle.inner.db().delete(key)?;
+        Ok(())
     })
 }
 
 /// Delete every entry in the store (`corekv.Dropable`).
 ///
 /// # Safety
-/// `db` must be a live handle.
+/// `db` must be a live handle. `err` must be null or writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn regolith_db_drop_all(db: *mut RegolithDb) -> i32 {
-    guard(|| {
+pub unsafe extern "C" fn regolith_db_drop_all(
+    db: *mut RegolithDb,
+    err: *mut *mut RegolithError,
+) -> i32 {
+    guard(err, || {
         let handle = db_ref!(db);
-        match handle.inner.db().drop_all() {
-            Ok(()) => OK,
-            Err(e) => status_of(&e),
-        }
+        handle.inner.db().drop_all()?;
+        Ok(())
     })
 }
 
@@ -266,26 +252,24 @@ pub unsafe extern "C" fn regolith_db_drop_all(db: *mut RegolithDb) -> i32 {
 /// # Safety
 /// `opts` must be null (meaning "defaults") or point at a valid
 /// [`RegolithIterOptions`] whose byte pointers are valid for the
-/// duration of the call. `out` must be writable.
+/// duration of the call. `out` must be writable. `err` must be null or
+/// writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn regolith_db_iter(
     db: *mut RegolithDb,
     opts: *const RegolithIterOptions,
     out: *mut *mut RegolithIter,
+    err: *mut *mut RegolithError,
 ) -> i32 {
-    guard(|| {
+    guard(err, || {
         let handle = db_ref!(db);
         if out.is_null() {
-            set_error("null out-param");
-            return INVALID_ARG;
+            return Err(Failure::invalid_arg("null out-param"));
         }
-        let bounds = match unsafe { crate::iter::bounds_from(opts) } {
-            Ok(bounds) => bounds,
-            Err(status) => return status,
-        };
+        let bounds = unsafe { crate::iter::bounds_from(opts) };
         let iter = RegolithIter::over_snapshot(handle.inner.db().snapshot(), bounds);
         unsafe { *out = Box::into_raw(Box::new(iter)) };
-        OK
+        Ok(())
     })
 }
 
@@ -298,18 +282,19 @@ pub unsafe extern "C" fn regolith_db_iter(
 /// rejected with `REGOLITH_ERR_READ_ONLY_TXN`.
 ///
 /// # Safety
-/// `db` must be live; `out` must be writable.
+/// `db` must be live; `out` must be writable. `err` must be null or
+/// writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn regolith_db_txn(
     db: *mut RegolithDb,
     readonly: u8,
     out: *mut *mut RegolithTxn,
+    err: *mut *mut RegolithError,
 ) -> i32 {
-    guard(|| {
+    guard(err, || {
         let handle = db_ref!(db);
         if out.is_null() {
-            set_error("null out-param");
-            return INVALID_ARG;
+            return Err(Failure::invalid_arg("null out-param"));
         }
         let owned = handle
             .inner
@@ -318,6 +303,6 @@ pub unsafe extern "C" fn regolith_db_txn(
             inner: Arc::new(TxnInner::new(owned, readonly != 0)),
         };
         unsafe { *out = Box::into_raw(Box::new(txn)) };
-        OK
+        Ok(())
     })
 }

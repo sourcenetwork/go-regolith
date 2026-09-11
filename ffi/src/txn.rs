@@ -14,8 +14,8 @@ use regolith::OwnedTransaction;
 
 use crate::iter::{RegolithIter, RegolithIterOptions};
 use crate::{
-    DISCARDED, INVALID_ARG, NOT_FOUND, OK, OTHER, READ_ONLY_TXN, RegolithValue, guard, in_bytes,
-    out_bool, out_borrowed, set_error, txn_status_of,
+    DISCARDED, Failure, NOT_FOUND, READ_ONLY_TXN, RegolithError, RegolithValue, guard, in_bytes,
+    out_bool, out_borrowed,
 };
 
 /// The shared body of a transaction handle.
@@ -42,23 +42,25 @@ impl TxnInner {
 
     /// Run `body` against the live transaction, or fail with
     /// [`DISCARDED`] if it has already been resolved.
-    pub(crate) fn with<R>(&self, body: impl FnOnce(&OwnedTransaction) -> R) -> Result<R, i32> {
+    pub(crate) fn with<R>(&self, body: impl FnOnce(&OwnedTransaction) -> R) -> Result<R, Failure> {
         let Ok(guard) = self.txn.read() else {
-            set_error("transaction lock poisoned");
-            return Err(OTHER);
+            return Err(Failure::other(
+                "transaction unusable after a panic; discard it and begin a new one",
+            ));
         };
         match guard.as_ref() {
             Some(txn) => Ok(body(txn)),
-            None => Err(DISCARDED),
+            None => Err(Failure::code(DISCARDED)),
         }
     }
 
-    fn take(&self) -> Result<OwnedTransaction, i32> {
+    fn take(&self) -> Result<OwnedTransaction, Failure> {
         let Ok(mut guard) = self.txn.write() else {
-            set_error("transaction lock poisoned");
-            return Err(OTHER);
+            return Err(Failure::other(
+                "transaction unusable after a panic; discard it and begin a new one",
+            ));
         };
-        guard.take().ok_or(DISCARDED)
+        guard.take().ok_or_else(|| Failure::code(DISCARDED))
     }
 }
 
@@ -71,10 +73,7 @@ macro_rules! txn_ref {
     ($ptr:expr) => {
         match unsafe { $ptr.as_ref() } {
             Some(txn) => txn,
-            None => {
-                set_error("null txn handle");
-                return INVALID_ARG;
-            }
+            None => return Err(Failure::invalid_arg("null txn handle")),
         }
     };
 }
@@ -90,9 +89,10 @@ macro_rules! txn_ref {
 /// Returns [`NOT_FOUND`] with no handle produced when absent.
 ///
 /// # Safety
-/// `key` must be valid for `key_len` bytes. On [`OK`], `(*val, *val_len)`
-/// is borrowed until `regolith_release_value` is called on `*handle`,
-/// which the caller must always do.
+/// `key` must be valid for `key_len` bytes. On [`OK`](crate::OK),
+/// `(*val, *val_len)` is borrowed until `regolith_release_value` is
+/// called on `*handle`, which the caller must always do. `err` must be
+/// null or writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn regolith_txn_get_borrowed(
     txn: *mut RegolithTxn,
@@ -101,19 +101,17 @@ pub unsafe extern "C" fn regolith_txn_get_borrowed(
     val: *mut *const u8,
     val_len: *mut usize,
     value_handle: *mut *mut RegolithValue,
+    err: *mut *mut RegolithError,
 ) -> i32 {
-    guard(|| {
+    guard(err, || {
         let handle = txn_ref!(txn);
         let Some(key) = (unsafe { in_bytes(key, key_len) }) else {
-            set_error("null key");
-            return INVALID_ARG;
+            return Err(Failure::invalid_arg("null key"));
         };
-        match handle.inner.with(|t| t.get_slice(key)) {
-            Err(status) => status,
-            Ok(Ok(Some(slice))) => unsafe { out_borrowed(slice, val, val_len, value_handle) },
-            Ok(Ok(None)) => NOT_FOUND,
-            Ok(Err(e)) => txn_status_of(&e),
-        }
+        let Some(slice) = handle.inner.with(|t| t.get_slice(key))?? else {
+            return Err(Failure::code(NOT_FOUND));
+        };
+        unsafe { out_borrowed(slice, val, val_len, value_handle) }
     })
 }
 
@@ -123,25 +121,25 @@ pub unsafe extern "C" fn regolith_txn_get_borrowed(
 /// value discarded.
 ///
 /// # Safety
-/// As [`regolith_txn_get_borrowed`]; `found` must be writable.
+/// As [`regolith_txn_get_borrowed`]; `found` must be writable; `err`
+/// must be null or writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn regolith_txn_has(
     txn: *mut RegolithTxn,
     key: *const u8,
     key_len: usize,
     found: *mut u8,
+    err: *mut *mut RegolithError,
 ) -> i32 {
-    guard(|| {
+    guard(err, || {
         let handle = txn_ref!(txn);
         let Some(key) = (unsafe { in_bytes(key, key_len) }) else {
-            set_error("null key");
-            return INVALID_ARG;
+            return Err(Failure::invalid_arg("null key"));
         };
-        match handle.inner.with(|t| t.get_slice(key).map(|v| v.is_some())) {
-            Err(status) => status,
-            Ok(Ok(found_value)) => unsafe { out_bool(found_value, found) },
-            Ok(Err(e)) => txn_status_of(&e),
-        }
+        let found_value = handle
+            .inner
+            .with(|t| t.get_slice(key).map(|v| v.is_some()))??;
+        unsafe { out_bool(found_value, found) }
     })
 }
 
@@ -149,7 +147,7 @@ pub unsafe extern "C" fn regolith_txn_has(
 ///
 /// # Safety
 /// `key` and `value` must be valid for their lengths; neither is
-/// retained past the call.
+/// retained past the call. `err` must be null or writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn regolith_txn_set(
     txn: *mut RegolithTxn,
@@ -157,50 +155,45 @@ pub unsafe extern "C" fn regolith_txn_set(
     key_len: usize,
     value: *const u8,
     value_len: usize,
+    err: *mut *mut RegolithError,
 ) -> i32 {
-    guard(|| {
+    guard(err, || {
         let handle = txn_ref!(txn);
         if handle.inner.readonly {
-            return READ_ONLY_TXN;
+            return Err(Failure::code(READ_ONLY_TXN));
         }
         let (Some(key), Some(value)) = (unsafe { in_bytes(key, key_len) }, unsafe {
             in_bytes(value, value_len)
         }) else {
-            set_error("null key or value");
-            return INVALID_ARG;
+            return Err(Failure::invalid_arg("null key or value"));
         };
-        match handle.inner.with(|t| t.put(key, value)) {
-            Err(status) => status,
-            Ok(Ok(())) => OK,
-            Ok(Err(e)) => txn_status_of(&e),
-        }
+        handle.inner.with(|t| t.put(key, value))??;
+        Ok(())
     })
 }
 
 /// Buffer a delete in the transaction.
 ///
 /// # Safety
-/// `key` must be valid for `key_len` bytes.
+/// `key` must be valid for `key_len` bytes. `err` must be null or
+/// writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn regolith_txn_delete(
     txn: *mut RegolithTxn,
     key: *const u8,
     key_len: usize,
+    err: *mut *mut RegolithError,
 ) -> i32 {
-    guard(|| {
+    guard(err, || {
         let handle = txn_ref!(txn);
         if handle.inner.readonly {
-            return READ_ONLY_TXN;
+            return Err(Failure::code(READ_ONLY_TXN));
         }
         let Some(key) = (unsafe { in_bytes(key, key_len) }) else {
-            set_error("null key");
-            return INVALID_ARG;
+            return Err(Failure::invalid_arg("null key"));
         };
-        match handle.inner.with(|t| t.delete(key)) {
-            Err(status) => status,
-            Ok(Ok(())) => OK,
-            Ok(Err(e)) => txn_status_of(&e),
-        }
+        handle.inner.with(|t| t.delete(key))??;
+        Ok(())
     })
 }
 
@@ -213,76 +206,71 @@ pub unsafe extern "C" fn regolith_txn_delete(
 ///
 /// # Safety
 /// `opts` must be null or valid for the duration of the call; `out` must
-/// be writable.
+/// be writable. `err` must be null or writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn regolith_txn_iter(
     txn: *mut RegolithTxn,
     opts: *const RegolithIterOptions,
     out: *mut *mut RegolithIter,
+    err: *mut *mut RegolithError,
 ) -> i32 {
-    guard(|| {
+    guard(err, || {
         let handle = txn_ref!(txn);
         if out.is_null() {
-            set_error("null out-param");
-            return INVALID_ARG;
+            return Err(Failure::invalid_arg("null out-param"));
         }
-        let bounds = match unsafe { crate::iter::bounds_from(opts) } {
-            Ok(bounds) => bounds,
-            Err(status) => return status,
-        };
-        match RegolithIter::over_txn(Arc::clone(&handle.inner), bounds) {
-            Ok(iter) => {
-                unsafe { *out = Box::into_raw(Box::new(iter)) };
-                OK
-            }
-            Err(status) => status,
-        }
+        let bounds = unsafe { crate::iter::bounds_from(opts) };
+        let iter = RegolithIter::over_txn(Arc::clone(&handle.inner), bounds)?;
+        unsafe { *out = Box::into_raw(Box::new(iter)) };
+        Ok(())
     })
 }
 
 /// Validate and apply the transaction. Returns [`crate::TXN_CONFLICT`] if
 /// another writer touched a validated key first, in which case the
 /// transaction is resolved and the caller should retry from a new one.
+/// A conflict carries no detail; the code is the message.
 ///
 /// The handle stays allocated afterwards; release it with
 /// [`regolith_txn_free`].
 ///
 /// # Safety
-/// `txn` must be a live handle.
+/// `txn` must be a live handle. `err` must be null or writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn regolith_txn_commit(txn: *mut RegolithTxn) -> i32 {
-    guard(|| {
+pub unsafe extern "C" fn regolith_txn_commit(
+    txn: *mut RegolithTxn,
+    err: *mut *mut RegolithError,
+) -> i32 {
+    guard(err, || {
         let handle = txn_ref!(txn);
-        match handle.inner.take() {
-            Err(status) => status,
-            Ok(owned) => match owned.commit() {
-                Ok(()) => OK,
-                Err(e) => txn_status_of(&e),
-            },
-        }
+        handle.inner.take()?.commit()?;
+        Ok(())
     })
 }
 
 /// Discard the transaction, dropping its buffered writes. Idempotent:
-/// discarding an already-resolved transaction is [`OK`].
+/// discarding an already-resolved transaction is [`OK`](crate::OK).
 ///
 /// The handle stays allocated afterwards; release it with
 /// [`regolith_txn_free`].
 ///
 /// # Safety
-/// `txn` must be a live handle.
+/// `txn` must be a live handle. `err` must be null or writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn regolith_txn_discard(txn: *mut RegolithTxn) -> i32 {
-    guard(|| {
+pub unsafe extern "C" fn regolith_txn_discard(
+    txn: *mut RegolithTxn,
+    err: *mut *mut RegolithError,
+) -> i32 {
+    guard(err, || {
         let handle = txn_ref!(txn);
         match handle.inner.take() {
             Ok(owned) => {
                 owned.rollback();
-                OK
+                Ok(())
             }
             // Already committed or discarded: nothing to do.
-            Err(DISCARDED) => OK,
-            Err(status) => status,
+            Err(failure) if failure.status == DISCARDED => Ok(()),
+            Err(failure) => Err(failure),
         }
     })
 }
@@ -293,17 +281,20 @@ pub unsafe extern "C" fn regolith_txn_discard(txn: *mut RegolithTxn) -> i32 {
 ///
 /// # Safety
 /// `txn` must be a handle from `regolith_db_txn` that has not been freed.
+/// `err` must be null or writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn regolith_txn_free(txn: *mut RegolithTxn) -> i32 {
-    guard(|| {
+pub unsafe extern "C" fn regolith_txn_free(
+    txn: *mut RegolithTxn,
+    err: *mut *mut RegolithError,
+) -> i32 {
+    guard(err, || {
         if txn.is_null() {
-            set_error("null txn handle");
-            return INVALID_ARG;
+            return Err(Failure::invalid_arg("null txn handle"));
         }
         let handle = unsafe { Box::from_raw(txn) };
         if let Ok(owned) = handle.inner.take() {
             owned.rollback();
         }
-        OK
+        Ok(())
     })
 }

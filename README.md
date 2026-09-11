@@ -152,7 +152,7 @@ call is a no-op (`Commit` after a resolution returns `ErrDiscarded`).
 All errors are sentinel values usable with `errors.Is`: `ErrNotFound`,
 `ErrClosed`, `ErrConflict`, `ErrReadOnly`, `ErrDiscarded`, plus
 `ErrInvalidArgument`, `ErrPanic` and `ErrUnexpected`, which are wrapped with the
-detail string the FFI layer records.
+detail the FFI layer hands back with the status.
 
 ## Make targets
 

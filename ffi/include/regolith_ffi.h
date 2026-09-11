@@ -10,17 +10,19 @@
  *
  * Status codes
  *   Every function returns int32_t. REGOLITH_OK (0) is success. Anything
- *   else is a failure and no out-param has been written, except where a
- *   function's comment says otherwise.
+ *   else is a failure and no out-param other than *err has been written,
+ *   except where a function's comment says otherwise.
  *
  * Error detail
- *   For REGOLITH_ERR_OTHER, REGOLITH_ERR_PANIC and
- *   REGOLITH_ERR_TXN_CONFLICT a human-readable detail string is stored in
- *   a thread-local slot. Read it with regolith_last_error_message(), which
- *   returns a freshly allocated NUL-terminated string (or NULL), and
- *   release it with regolith_free_string(). The slot belongs to the
- *   calling OS thread, so read it on the same thread that got the status,
- *   before making another call on that thread.
+ *   Every status-returning function takes a trailing RegolithError **err.
+ *   It may be NULL, meaning the caller does not want detail. Otherwise
+ *   the call writes *err exactly once, before returning: NULL on
+ *   REGOLITH_OK and for every code that is its own message, or an object
+ *   the caller owns for REGOLITH_ERR_INVALID_ARG, REGOLITH_ERR_PANIC and
+ *   REGOLITH_ERR_OTHER. Read it with regolith_error_message() and release
+ *   it with regolith_error_free(), exactly once. The detail travels with
+ *   the status in the same call, so nothing is keyed on the calling
+ *   thread and the object may be read and freed from any thread.
  *
  * Panics
  *   Every entry point catches Rust panics and returns
@@ -99,7 +101,9 @@
  *   once, but commit/discard/free must not race with anything else on it.
  *   A RegolithIter handle is not thread-safe; use it from one thread at a
  *   time. A RegolithValue is read-only bytes plus an atomic refcount, so
- *   it may be read from any thread, but release it exactly once.
+ *   it may be read from any thread, but release it exactly once. A
+ *   RegolithError is immutable; read it from any thread, free it exactly
+ *   once.
  */
 
 #ifndef REGOLITH_FFI_H
@@ -131,7 +135,7 @@ extern "C" {
 #define REGOLITH_ERR_INVALID_ARG 6
 /* A Rust panic was caught at the boundary. */
 #define REGOLITH_ERR_PANIC 7
-/* Anything else; see regolith_last_error_message(). */
+/* Anything else; the detail says what. */
 #define REGOLITH_ERR_OTHER 8
 
 /* --------------------------------------------------------------------
@@ -146,6 +150,10 @@ typedef struct RegolithIter RegolithIter;
  * reference count on whatever inside the engine owns them. See "Borrowed
  * output bytes" above. */
 typedef struct RegolithValue RegolithValue;
+
+/* Detail behind a status whose code alone does not say what went wrong;
+ * see "Error detail" above. */
+typedef struct RegolithError RegolithError;
 
 /* --------------------------------------------------------------------
  * Iteration options.
@@ -276,12 +284,12 @@ typedef struct RegolithOptions {
  * #[inline(never)] on the Rust side so it is a real call. */
 void regolith_noop(void);
 
-/* Last error detail for the calling thread, freshly allocated, or NULL.
- * Release with regolith_free_string. */
-char *regolith_last_error_message(void);
+/* The detail's message, NUL-terminated, borrowed from the object and
+ * valid until regolith_error_free. NULL for a NULL object. */
+const char *regolith_error_message(const RegolithError *err);
 
-/* Release a string from regolith_last_error_message. NULL is a no-op. */
-void regolith_free_string(char *s);
+/* Release a detail object. NULL is a no-op. Exactly once per object. */
+void regolith_error_free(RegolithError *err);
 
 /* Release a buffer handed out by any key/value call. Pass back exactly
  * the (ptr, len) pair received. NULL or len 0 is a no-op. */
@@ -302,7 +310,7 @@ void regolith_release_value(RegolithValue *handle);
  * `opts`. On REGOLITH_OK, *out owns a handle to be released with
  * regolith_db_close. */
 int32_t regolith_db_open(const uint8_t *path, size_t path_len,
-                         RegolithDb **out);
+                         RegolithDb **out, RegolithError **err);
 
 /* Open (or create) a store with the engine options in `opts`. `opts` may
  * be NULL, and a struct whose `present` mask is empty is equivalent:
@@ -313,12 +321,12 @@ int32_t regolith_db_open(const uint8_t *path, size_t path_len,
  * regolith_db_close. */
 int32_t regolith_db_open_with_options(const uint8_t *path, size_t path_len,
                                       const RegolithOptions *opts,
-                                      RegolithDb **out);
+                                      RegolithDb **out, RegolithError **err);
 
 /* Close the store and free the handle. The handle is invalid afterwards
  * even when a non-OK status is returned. All derived transactions and
  * iterators must already be closed. */
-int32_t regolith_db_close(RegolithDb *db);
+int32_t regolith_db_close(RegolithDb *db, RegolithError **err);
 
 /* Read a key without copying it. On REGOLITH_OK, (*val, *val_len) is a
  * borrowed view of bytes the engine owns and *handle keeps them alive;
@@ -328,27 +336,30 @@ int32_t regolith_db_close(RegolithDb *db);
  * output bytes" above for the full rule. */
 int32_t regolith_db_get_borrowed(RegolithDb *db, const uint8_t *key,
                                  size_t key_len, const uint8_t **val,
-                                 size_t *val_len, RegolithValue **handle);
+                                 size_t *val_len, RegolithValue **handle,
+                                 RegolithError **err);
 
 /* Test for a key, writing 0 or 1 to *found. */
 int32_t regolith_db_has(RegolithDb *db, const uint8_t *key, size_t key_len,
-                        uint8_t *found);
+                        uint8_t *found, RegolithError **err);
 
 /* Write a value, overwriting any existing entry. */
 int32_t regolith_db_set(RegolithDb *db, const uint8_t *key, size_t key_len,
-                        const uint8_t *value, size_t value_len);
+                        const uint8_t *value, size_t value_len,
+                        RegolithError **err);
 
 /* Delete a key. Deleting an absent key is REGOLITH_OK. */
-int32_t regolith_db_delete(RegolithDb *db, const uint8_t *key, size_t key_len);
+int32_t regolith_db_delete(RegolithDb *db, const uint8_t *key, size_t key_len,
+                           RegolithError **err);
 
 /* Delete every entry in the store (corekv.Dropable.DropAll). */
-int32_t regolith_db_drop_all(RegolithDb *db);
+int32_t regolith_db_drop_all(RegolithDb *db, RegolithError **err);
 
 /* Create an iterator over a snapshot of the store taken now. `opts` may
  * be NULL, meaning full forward iteration with values. On REGOLITH_OK,
  * *out owns a handle to be released with regolith_iter_close. */
 int32_t regolith_db_iter(RegolithDb *db, const RegolithIterOptions *opts,
-                         RegolithIter **out);
+                         RegolithIter **out, RegolithError **err);
 
 /* Begin an optimistic transaction at the store's configured isolation
  * level - the one RegolithOptions.isolation selected at open, which is
@@ -357,7 +368,8 @@ int32_t regolith_db_iter(RegolithDb *db, const RegolithIterOptions *opts,
  * REGOLITH_ERR_READ_ONLY_TXN; regolith itself has no read-only mode, so
  * the flag is enforced by this layer. On REGOLITH_OK, *out owns a handle
  * to be released with regolith_txn_free. */
-int32_t regolith_db_txn(RegolithDb *db, uint8_t readonly, RegolithTxn **out);
+int32_t regolith_db_txn(RegolithDb *db, uint8_t readonly, RegolithTxn **out,
+                        RegolithError **err);
 
 /* --------------------------------------------------------------------
  * Transaction.
@@ -369,41 +381,44 @@ int32_t regolith_db_txn(RegolithDb *db, uint8_t readonly, RegolithTxn **out);
  * handle stays valid across its commit or discard. */
 int32_t regolith_txn_get_borrowed(RegolithTxn *txn, const uint8_t *key,
                                   size_t key_len, const uint8_t **val,
-                                  size_t *val_len, RegolithValue **handle);
+                                  size_t *val_len, RegolithValue **handle,
+                                  RegolithError **err);
 
 /* Test for a key through the transaction, writing 0 or 1 to *found. */
 int32_t regolith_txn_has(RegolithTxn *txn, const uint8_t *key, size_t key_len,
-                         uint8_t *found);
+                         uint8_t *found, RegolithError **err);
 
 /* Buffer a write. REGOLITH_ERR_READ_ONLY_TXN on a read-only txn. */
 int32_t regolith_txn_set(RegolithTxn *txn, const uint8_t *key, size_t key_len,
-                         const uint8_t *value, size_t value_len);
+                         const uint8_t *value, size_t value_len,
+                         RegolithError **err);
 
 /* Buffer a delete. REGOLITH_ERR_READ_ONLY_TXN on a read-only txn. */
 int32_t regolith_txn_delete(RegolithTxn *txn, const uint8_t *key,
-                            size_t key_len);
+                            size_t key_len, RegolithError **err);
 
 /* Create an iterator over the transaction: its buffered writes merged
  * over its begin snapshot. The write set is sampled on first advance and
  * on each rebuild, not here. See ordering contracts 1 and 3 above. */
 int32_t regolith_txn_iter(RegolithTxn *txn, const RegolithIterOptions *opts,
-                          RegolithIter **out);
+                          RegolithIter **out, RegolithError **err);
 
 /* Validate and apply the transaction. REGOLITH_ERR_TXN_CONFLICT when
  * another writer touched a validated key first; the transaction is
- * resolved either way and the caller should retry from a new one.
+ * resolved either way and the caller should retry from a new one. A
+ * conflict carries no detail; the code is the message.
  * REGOLITH_ERR_DISCARDED if already resolved. The handle stays
  * allocated; release it with regolith_txn_free. */
-int32_t regolith_txn_commit(RegolithTxn *txn);
+int32_t regolith_txn_commit(RegolithTxn *txn, RegolithError **err);
 
 /* Discard the transaction, dropping its buffered writes. Idempotent:
  * REGOLITH_OK even if already resolved. The handle stays allocated;
  * release it with regolith_txn_free. */
-int32_t regolith_txn_discard(RegolithTxn *txn);
+int32_t regolith_txn_discard(RegolithTxn *txn, RegolithError **err);
 
 /* Free the transaction handle, discarding first if still unresolved.
  * Exactly once per handle, after all its iterators are closed. */
-int32_t regolith_txn_free(RegolithTxn *txn);
+int32_t regolith_txn_free(RegolithTxn *txn, RegolithError **err);
 
 /* --------------------------------------------------------------------
  * Iterator.
@@ -424,7 +439,8 @@ int32_t regolith_txn_free(RegolithTxn *txn);
 
 /* Advance (or, after construction/reset, position at the start of the
  * range). Writes 0 or 1 to *valid. */
-int32_t regolith_iter_next(RegolithIter *it, uint8_t *valid);
+int32_t regolith_iter_next(RegolithIter *it, uint8_t *valid,
+                           RegolithError **err);
 
 /* Seek, clamped to the configured range: a target below `start` becomes
  * `start`, and under `reverse` a target at or above `end` becomes the top
@@ -434,21 +450,24 @@ int32_t regolith_iter_next(RegolithIter *it, uint8_t *valid);
  * following regolith_iter_next_batch starts on the entry sought.
  * Invalidates the current batch and its value pointers. */
 int32_t regolith_iter_seek(RegolithIter *it, const uint8_t *key,
-                           size_t key_len, uint8_t *valid);
+                           size_t key_len, uint8_t *valid,
+                           RegolithError **err);
 
 /* Mark for re-iteration: the next regolith_iter_next returns to the
  * start of the range. Invalidates the current batch and its value
  * pointers. Never fails on a live handle. */
-int32_t regolith_iter_reset(RegolithIter *it);
+int32_t regolith_iter_reset(RegolithIter *it, RegolithError **err);
 
 /* Copy out the current key. REGOLITH_ERR_NOT_FOUND when the iterator is
  * not positioned on a valid in-range entry. */
-int32_t regolith_iter_key(RegolithIter *it, uint8_t **key, size_t *key_len);
+int32_t regolith_iter_key(RegolithIter *it, uint8_t **key, size_t *key_len,
+                          RegolithError **err);
 
 /* Copy out the current value, or a zero-length buffer when the iterator
  * was created with keys_only. REGOLITH_ERR_NOT_FOUND when not
  * positioned on a valid in-range entry. */
-int32_t regolith_iter_value(RegolithIter *it, uint8_t **val, size_t *val_len);
+int32_t regolith_iter_value(RegolithIter *it, uint8_t **val, size_t *val_len,
+                            RegolithError **err);
 
 /* Advance up to `max_entries` times, framing the KEYS walked into one
  * buffer:
@@ -479,7 +498,7 @@ int32_t regolith_iter_value(RegolithIter *it, uint8_t **val, size_t *val_len);
  * why its total is capped. */
 int32_t regolith_iter_next_batch(RegolithIter *it, size_t max_entries,
                                  uint8_t **out, size_t *out_len,
-                                 size_t *out_count);
+                                 size_t *out_count, RegolithError **err);
 
 /* Borrowed pointer to value #idx of the current batch, counting from 0
  * in the order the keys were framed. No allocation, and nothing to
@@ -492,10 +511,11 @@ int32_t regolith_iter_next_batch(RegolithIter *it, size_t max_entries,
  * An `idx` at or beyond the last batch's *out_count is
  * REGOLITH_ERR_INVALID_ARG. */
 int32_t regolith_iter_batch_value(RegolithIter *it, size_t idx,
-                                  const uint8_t **val, size_t *val_len);
+                                  const uint8_t **val, size_t *val_len,
+                                  RegolithError **err);
 
 /* Close the iterator and free its handle. Exactly once per handle. */
-int32_t regolith_iter_close(RegolithIter *it);
+int32_t regolith_iter_close(RegolithIter *it, RegolithError **err);
 
 #ifdef __cplusplus
 }
