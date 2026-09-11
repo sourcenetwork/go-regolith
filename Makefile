@@ -16,13 +16,17 @@ ffi-debug:
 	cargo build --manifest-path ffi/Cargo.toml
 
 # The archive distributed in go-regolith-prebuilt, with debug information
-# removed.  Roughly a third smaller, and it shrinks the caller's linked binary
-# by about as much, because the linker copies less in.
+# removed.  About half the size of the LTO archive (9.7 MB to 4.7 MB on x86_64
+# Linux); the caller's linked binary shrinks by only a few percent, because the
+# linker already drops most of what strip removes.
 #
 # Cargo's own `strip` profile setting does nothing here: stripping happens at
 # link time and a staticlib is never linked, it is an archive of object files.
-# LTO is no help either - fat LTO embeds bitcode and makes the archive larger.
-# So the only thing that works is stripping the archive after the fact.
+# Fat LTO (ffi/Cargo.toml) does most of the shrinking on its own by folding
+# the dependencies into one optimised object (28.3 MB to 9.7 MB); what strip
+# removes on top is the debug information that arrives with the precompiled
+# standard library and compiler-builtins objects, which the profile cannot
+# reach.
 #
 # `ffi` deliberately stays unstripped so that a Rust-side crash in development
 # still symbolicates.

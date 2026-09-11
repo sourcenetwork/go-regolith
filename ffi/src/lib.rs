@@ -356,3 +356,6 @@ pub(crate) mod tests {
         Some(message)
     }
 }
+
+#[cfg(test)]
+mod abi_tests;

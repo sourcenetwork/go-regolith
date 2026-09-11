@@ -1,12 +1,15 @@
-//! Integration tests that drive the C ABI the way cgo will: raw
-//! pointers, out-params, integer statuses, explicit frees.
+//! Tests that drive the C ABI the way cgo does: raw pointers, out-params,
+//! integer statuses, explicit frees.
 //!
-//! This is the gate on the FFI layer. The Go wrapper does not exist yet,
-//! so anything these tests do not cover is unverified.
+//! This is the gate on the FFI layer: anything these tests do not cover is
+//! verified only through the Go tests one directory up. They live inside
+//! the crate because it is built as a staticlib only, which no external
+//! test target can link.
 
 use std::ptr;
 
-use regolith_ffi::*;
+use crate::tests::last_error;
+use crate::*;
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------
@@ -34,18 +37,6 @@ fn take_buf(ptr: *mut u8, len: usize) -> Vec<u8> {
     };
     unsafe { regolith_free_buf(ptr, len) };
     copied
-}
-
-fn last_error() -> Option<String> {
-    let raw = regolith_last_error_message();
-    if raw.is_null() {
-        return None;
-    }
-    let message = unsafe { std::ffi::CStr::from_ptr(raw) }
-        .to_string_lossy()
-        .into_owned();
-    unsafe { regolith_free_string(raw) };
-    Some(message)
 }
 
 fn set(db: *mut RegolithDb, key: &[u8], value: &[u8]) {
