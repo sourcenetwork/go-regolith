@@ -540,14 +540,7 @@ func BenchmarkWriteBatch(b *testing.B) {
 			db := benchDB(b)
 			keys := benchKeys(shape.keys)
 			value := benchValue(shape.value)
-
-			prefill := NewWriteBatch(0)
-			for _, key := range keys {
-				prefill.Set(key, value)
-			}
-			if err := db.Write(prefill); err != nil {
-				b.Fatalf("prefill write: %v", err)
-			}
+			benchPrefill(b, db, keys, value)
 
 			wb := NewWriteBatch(0)
 			b.ReportAllocs()

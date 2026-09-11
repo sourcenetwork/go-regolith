@@ -89,8 +89,6 @@ package regolith
 // #cgo nocallback regolith_txn_commit
 // #cgo noescape regolith_txn_delete
 // #cgo nocallback regolith_txn_delete
-// #cgo noescape regolith_txn_discard
-// #cgo nocallback regolith_txn_discard
 // #cgo noescape regolith_txn_free
 // #cgo nocallback regolith_txn_free
 // #cgo noescape regolith_txn_get_borrowed
@@ -386,13 +384,14 @@ func (db *DB) NewTxn(readOnly bool) (*Txn, error) {
 // resolution is not concurrent with them.  Every [Iter] created from a
 // transaction must be closed before it is resolved.
 //
-// Handle lifecycle: `regolith_txn_commit` and `regolith_txn_discard` resolve the
-// transaction but leave the handle allocated, and `regolith_txn_free` must be
-// called exactly once per handle.  Both [Txn.Commit] and [Txn.Discard] therefore
-// free the handle themselves and mark the transaction resolved, and whichever of
-// the two is called second does nothing.  That covers the usual pattern of a
-// deferred `Discard` alongside a `Commit`, and it means a committed handle is
-// freed as soon as it becomes useless.
+// Handle lifecycle: `regolith_txn_commit` consumes and frees the handle, and
+// `regolith_txn_free` rolls back an unresolved transaction and frees it, so
+// each resolution is one crossing.  Whichever of [Txn.Commit] and
+// [Txn.Discard] runs first releases the handle and marks the transaction
+// resolved; the other then does nothing, which covers the usual pattern of a
+// deferred `Discard` alongside a `Commit`.  A resolved transaction holds no
+// handle at all, so no later call can reach freed memory: every operation
+// checks `resolved` under `lk` before touching the handle.
 type Txn struct {
 	t  *C.RegolithTxn
 	db *DB
@@ -531,7 +530,8 @@ func (t *Txn) NewIter(opts IterOptions) (*Iter, error) {
 //
 // It returns [ErrConflict] when another writer touched a validated key first;
 // the transaction is resolved either way, and the work should be retried from a
-// new transaction.  A second resolution returns [ErrDiscarded].
+// new transaction.  A second resolution returns [ErrDiscarded].  The handle is
+// released by the commit itself, on success and on failure alike.
 func (t *Txn) Commit() error {
 	t.lk.Lock()
 	defer t.lk.Unlock()
@@ -543,12 +543,13 @@ func (t *Txn) Commit() error {
 	}
 
 	var cerr *C.RegolithError
-	err := statusToErr(C.regolith_txn_commit(t.t, &cerr), cerr)
+	status := C.regolith_txn_commit(t.t, &cerr)
 
+	// The call freed the handle whatever it returned.
 	t.resolved = true
-	C.regolith_txn_free(t.t, nil)
+	t.t = nil
 
-	return err
+	return statusToErr(status, cerr)
 }
 
 // Discard drops the transaction's buffered writes and releases its handle.
@@ -562,14 +563,14 @@ func (t *Txn) Discard() {
 		return
 	}
 
-	// `regolith_txn_discard` is idempotent and `regolith_txn_free` discards an
-	// unresolved transaction anyway, but discarding explicitly keeps the two
-	// steps legible.  Both are called even if the store has been closed, as the
-	// handle must be freed regardless and neither touches the store handle.
-	// Neither status is checked, hence the nil `err` on both.
-	C.regolith_txn_discard(t.t, nil)
-	t.resolved = true
+	// `regolith_txn_free` rolls back an unresolved transaction before
+	// releasing the handle, so one crossing resolves and frees.  It is
+	// called even if the store has been closed, as the handle must be
+	// freed regardless and it does not touch the store handle.  The
+	// status is not checked, hence the nil `err`.
 	C.regolith_txn_free(t.t, nil)
+	t.resolved = true
+	t.t = nil
 }
 
 // bytePtr returns a pointer to the first byte of the given slice, or nil if it

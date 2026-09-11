@@ -29,15 +29,15 @@ import (
 //
 // What an allocation count cannot catch: regolith_free_buf,
 // regolith_release_value, regolith_error_free, regolith_error_message, and
-// the nil-error calls this package makes to regolith_iter_reset,
-// regolith_txn_discard and regolith_txn_free take no out-param local at all,
-// so removing their directive cannot change what AllocsPerRun measures - a
-// passing test proves nothing about those seven. Nor can it see a detail
-// that is allocated and freed entirely on the Rust side (only a non-empty
-// message, copied onto the Go heap through C.GoString, errors.go:61-63,
-// shows up here), or prove that a function actually honours the directives
-// it carries - keeps no Go pointer past the call, never calls back into Go -
-// as opposed to merely never having been caught misbehaving.
+// the nil-error calls this package makes to regolith_iter_reset and
+// regolith_txn_free take no out-param local at all, so removing their
+// directive cannot change what AllocsPerRun measures - a passing test proves
+// nothing about those six. Nor can it see a detail that is allocated and
+// freed entirely on the Rust side (only a non-empty message, copied onto the
+// Go heap through C.GoString, errors.go:61-63, shows up here), or prove that
+// a function actually honours the directives it carries - keeps no Go pointer
+// past the call, never calls back into Go - as opposed to merely never having
+// been caught misbehaving.
 func TestSuccessPathAllocatesNothing(t *testing.T) {
 	db := newDB(t)
 

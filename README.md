@@ -172,7 +172,8 @@ The FFI layer owns real Rust handles, and they have to be released in order:
 2. Every `Txn` and `Iter` must be resolved before `DB.Close`.
 
 `Close`, `Commit` and `Discard` are each safe to call more than once; a second
-call is a no-op (`Commit` after a resolution returns `ErrDiscarded`).
+call is a no-op (`Commit` after a resolution returns `ErrDiscarded`). Each of
+`Commit` and `Discard` is a single call into the engine.
 
 ## Errors
 

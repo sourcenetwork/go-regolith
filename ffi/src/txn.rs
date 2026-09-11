@@ -231,8 +231,11 @@ pub unsafe extern "C" fn regolith_txn_iter(
 /// transaction is resolved and the caller should retry from a new one.
 /// A conflict carries no detail; the code is the message.
 ///
-/// The handle stays allocated afterwards; release it with
-/// [`regolith_txn_free`].
+/// Consumes the handle: whatever the status (OK, TXN_CONFLICT, DISCARDED,
+/// PANIC or OTHER), the handle is freed before this returns and must not
+/// be passed to any call again, including [`regolith_txn_free`]. Only a
+/// null `txn` (INVALID_ARG) frees nothing. Every iterator derived from the
+/// transaction must already be closed (ordering contract 1).
 ///
 /// # Safety
 /// `txn` must be a live handle. `err` must be null or writable.
@@ -242,7 +245,13 @@ pub unsafe extern "C" fn regolith_txn_commit(
     err: *mut *mut RegolithError,
 ) -> i32 {
     guard(err, || {
-        let handle = txn_ref!(txn);
+        if txn.is_null() {
+            return Err(Failure::invalid_arg("null txn handle"));
+        }
+        // SAFETY: a non-null `txn` is a live handle from `regolith_db_txn`
+        // by this function's contract; ownership comes back here and the
+        // box drops on every path below, so the caller never frees it.
+        let handle = unsafe { Box::from_raw(txn) };
         handle.inner.take()?.commit()?;
         Ok(())
     })
@@ -276,8 +285,10 @@ pub unsafe extern "C" fn regolith_txn_discard(
 }
 
 /// Free the transaction handle, discarding the transaction first if it is
-/// still unresolved. Must be called exactly once per handle, after every
-/// iterator derived from it has been closed.
+/// still unresolved. After a commit the handle is already gone; free is
+/// for a transaction that was discarded or never resolved. Must be called
+/// exactly once per handle, after every iterator derived from it has been
+/// closed.
 ///
 /// # Safety
 /// `txn` must be a handle from `regolith_db_txn` that has not been freed.

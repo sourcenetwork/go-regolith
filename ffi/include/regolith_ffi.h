@@ -34,6 +34,8 @@
  *   by this library, and released by their matching close/free function.
  *   Passing NULL returns REGOLITH_ERR_INVALID_ARG; it is never
  *   dereferenced. Passing an already-freed handle is undefined.
+ *   regolith_txn_commit is the one call that releases the handle it is
+ *   given; see its comment.
  *
  * Input bytes
  *   Inputs cross as (const uint8_t *ptr, size_t len) and are NOT retained
@@ -390,7 +392,8 @@ int32_t regolith_db_iter(RegolithDb *db, const RegolithIterOptions *opts,
  * non-zero to have regolith_txn_set/delete return
  * REGOLITH_ERR_READ_ONLY_TXN; regolith itself has no read-only mode, so
  * the flag is enforced by this layer. On REGOLITH_OK, *out owns a handle
- * to be released with regolith_txn_free. */
+ * that is released by regolith_txn_commit or, if the transaction is
+ * discarded or never resolved, by regolith_txn_free. */
 int32_t regolith_db_txn(RegolithDb *db, uint8_t readonly, RegolithTxn **out,
                         RegolithError **err);
 
@@ -430,8 +433,11 @@ int32_t regolith_txn_iter(RegolithTxn *txn, const RegolithIterOptions *opts,
  * another writer touched a validated key first; the transaction is
  * resolved either way and the caller should retry from a new one. A
  * conflict carries no detail; the code is the message.
- * REGOLITH_ERR_DISCARDED if already resolved. The handle stays
- * allocated; release it with regolith_txn_free. */
+ * REGOLITH_ERR_DISCARDED if already resolved. Consumes the handle
+ * whatever the status: it is freed before the call returns and must not
+ * be used again, not even with regolith_txn_free. Only a NULL txn
+ * (REGOLITH_ERR_INVALID_ARG) frees nothing. All iterators derived from
+ * it must already be closed (ordering contract 1). */
 int32_t regolith_txn_commit(RegolithTxn *txn, RegolithError **err);
 
 /* Discard the transaction, dropping its buffered writes. Idempotent:
@@ -439,8 +445,10 @@ int32_t regolith_txn_commit(RegolithTxn *txn, RegolithError **err);
  * release it with regolith_txn_free. */
 int32_t regolith_txn_discard(RegolithTxn *txn, RegolithError **err);
 
-/* Free the transaction handle, discarding first if still unresolved.
- * Exactly once per handle, after all its iterators are closed. */
+/* Free a transaction handle that was discarded or never resolved,
+ * discarding first if still unresolved. Exactly once per handle, after
+ * all its iterators are closed. Never after regolith_txn_commit, which
+ * frees the handle itself. */
 int32_t regolith_txn_free(RegolithTxn *txn, RegolithError **err);
 
 /* --------------------------------------------------------------------

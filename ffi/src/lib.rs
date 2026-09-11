@@ -9,7 +9,9 @@
 //! * Every entry point catches Rust panics and returns [`PANIC`] rather
 //!   than unwinding into the caller's frame.
 //! * Handles are opaque pointers created here and destroyed by the
-//!   matching `_close`/`_free`. A null handle is an error, never a
+//!   matching `_close`/`_free`, with one exception:
+//!   [`regolith_txn_commit`](crate::regolith_txn_commit) also releases
+//!   the handle it is given. A null handle is an error, never a
 //!   dereference.
 //! * Input bytes cross as `(*const u8, usize)` and are **not retained**
 //!   past the call, so the caller may pass Go memory directly.

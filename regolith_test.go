@@ -589,6 +589,66 @@ func TestTxnDiscardIsInvisible(t *testing.T) {
 	}
 }
 
+func TestTxnDiscardAfterCommitIsNoop(t *testing.T) {
+	db := newDB(t)
+	seed(t, db)
+
+	txn, err := db.NewTxn(false)
+	if err != nil {
+		t.Fatalf("new txn: %v", err)
+	}
+	if err := txn.Set([]byte("f"), []byte("vf")); err != nil {
+		t.Fatalf("txn set: %v", err)
+	}
+	if err := txn.Commit(); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	// The commit resolved the transaction on its own, before any discard:
+	// it released the handle, so no later call may reach it.
+	if err := txn.Set([]byte("g"), []byte("vg")); !errors.Is(err, ErrDiscarded) {
+		t.Errorf("set after commit: expected ErrDiscarded, got %v", err)
+	}
+
+	// Commit already released the handle; discarding afterwards must not
+	// touch it again.
+	txn.Discard()
+
+	if err := txn.Set([]byte("g"), []byte("vg")); !errors.Is(err, ErrDiscarded) {
+		t.Errorf("set after discard: expected ErrDiscarded, got %v", err)
+	}
+	if _, err := txn.Get([]byte("f")); !errors.Is(err, ErrDiscarded) {
+		t.Errorf("get after discard: expected ErrDiscarded, got %v", err)
+	}
+	if _, err := txn.Has([]byte("f")); !errors.Is(err, ErrDiscarded) {
+		t.Errorf("has after discard: expected ErrDiscarded, got %v", err)
+	}
+	if err := txn.Delete([]byte("f")); !errors.Is(err, ErrDiscarded) {
+		t.Errorf("delete after discard: expected ErrDiscarded, got %v", err)
+	}
+	if _, err := txn.NewIter(IterOptions{}); !errors.Is(err, ErrDiscarded) {
+		t.Errorf("new iter after discard: expected ErrDiscarded, got %v", err)
+	}
+	if err := txn.Commit(); !errors.Is(err, ErrDiscarded) {
+		t.Errorf("commit after discard: expected ErrDiscarded, got %v", err)
+	}
+	// A second discard is still a no-op.
+	txn.Discard()
+
+	// The store is unaffected by the extra resolutions on an already
+	// resolved handle.
+	value, err := db.Get([]byte("f"))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if string(value) != "vf" {
+		t.Errorf("expected vf, got %s", value)
+	}
+	if err := db.Set([]byte("g"), []byte("vg")); err != nil {
+		t.Errorf("set: %v", err)
+	}
+}
+
 func TestTxnConflict(t *testing.T) {
 	db := newDB(t)
 	if err := db.Set([]byte("k"), []byte("v0")); err != nil {
@@ -620,6 +680,16 @@ func TestTxnConflict(t *testing.T) {
 	}
 	if err := second.Commit(); !errors.Is(err, ErrConflict) {
 		t.Errorf("second commit: expected ErrConflict, got %v", err)
+	}
+
+	// A conflicted commit still consumes and frees the handle, so the
+	// transaction is resolved exactly as a plain commit leaves it.
+	if err := second.Set([]byte("k"), []byte("v3")); !errors.Is(err, ErrDiscarded) {
+		t.Errorf("set after conflict: expected ErrDiscarded, got %v", err)
+	}
+	second.Discard()
+	if err := second.Commit(); !errors.Is(err, ErrDiscarded) {
+		t.Errorf("commit after conflict: expected ErrDiscarded, got %v", err)
 	}
 
 	value, err := db.Get([]byte("k"))

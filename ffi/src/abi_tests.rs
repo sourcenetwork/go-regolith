@@ -1022,10 +1022,35 @@ fn txn_commit_is_visible() {
     assert_eq!(get(db, b"a").unwrap(), b"va");
 
     assert_eq!(unsafe { regolith_txn_commit(txn, ptr::null_mut()) }, OK);
-    assert_eq!(unsafe { regolith_txn_free(txn, ptr::null_mut()) }, OK);
 
     assert_eq!(get(db, b"f").unwrap(), b"vf");
     assert_eq!(get(db, b"a"), Err(NOT_FOUND));
+
+    close(db);
+}
+
+#[test]
+fn txn_commit_consumes_handle() {
+    let dir = TempDir::new().unwrap();
+    let db = open(&dir);
+
+    let txn = begin(db, false);
+    assert_eq!(txn_set(txn, b"k", b"v"), OK);
+    // SAFETY: `txn` is a live handle from `begin` above.
+    let inner = std::sync::Arc::clone(unsafe { &(*txn).inner });
+    assert_eq!(std::sync::Arc::strong_count(&inner), 2); // the Box and this clone.
+
+    assert_eq!(unsafe { regolith_txn_commit(txn, ptr::null_mut()) }, OK);
+
+    // The Box is gone: commit freed the handle, so only this clone remains.
+    assert_eq!(std::sync::Arc::strong_count(&inner), 1);
+    assert_eq!(
+        inner.with(|_| ()).map_err(|f| f.status),
+        Err(DISCARDED),
+        "a committed transaction reports itself resolved"
+    );
+    assert_eq!(get(db, b"k").unwrap(), b"v");
+    // No regolith_txn_free: the commit above already released the handle.
 
     close(db);
 }
@@ -1063,12 +1088,18 @@ fn txn_commit_after_resolution_reports_discarded() {
     let db = open(&dir);
 
     let txn = begin(db, false);
-    assert_eq!(unsafe { regolith_txn_commit(txn, ptr::null_mut()) }, OK);
+    assert_eq!(unsafe { regolith_txn_discard(txn, ptr::null_mut()) }, OK);
+    // SAFETY: `txn` is still a live handle; `regolith_txn_discard` resolves
+    // the transaction but does not free it.
+    let inner = std::sync::Arc::clone(unsafe { &(*txn).inner });
+
     assert_eq!(
         unsafe { regolith_txn_commit(txn, ptr::null_mut()) },
         DISCARDED
     );
-    assert_eq!(unsafe { regolith_txn_free(txn, ptr::null_mut()) }, OK);
+    // A commit that finds the transaction already resolved still frees the
+    // handle it was given; no separate regolith_txn_free is called.
+    assert_eq!(std::sync::Arc::strong_count(&inner), 1);
 
     close(db);
 }
@@ -1087,6 +1118,8 @@ fn txn_conflict_produces_the_conflict_code() {
     assert_eq!(txn_set(second, b"k", b"v2"), OK);
 
     assert_eq!(unsafe { regolith_txn_commit(first, ptr::null_mut()) }, OK);
+    // SAFETY: `second` is still a live handle at this point.
+    let second_inner = std::sync::Arc::clone(unsafe { &(*second).inner });
     // `err` starts pointing at garbage so a `guard` that skips the null
     // write on a bare code would be caught rather than masked by a
     // coincidentally-null starting value.
@@ -1100,9 +1133,9 @@ fn txn_conflict_produces_the_conflict_code() {
     );
     // C-6: nothing reads a conflict's text, so it carries no detail.
     assert!(err.is_null());
+    // A conflicted commit still consumes and frees the handle it was given.
+    assert_eq!(std::sync::Arc::strong_count(&second_inner), 1);
 
-    assert_eq!(unsafe { regolith_txn_free(first, ptr::null_mut()) }, OK);
-    assert_eq!(unsafe { regolith_txn_free(second, ptr::null_mut()) }, OK);
     assert_eq!(get(db, b"k").unwrap(), b"v1");
 
     close(db);
@@ -1130,7 +1163,6 @@ fn readonly_txn_rejects_writes() {
     assert_eq!(found, 1);
 
     assert_eq!(unsafe { regolith_txn_commit(txn, ptr::null_mut()) }, OK);
-    assert_eq!(unsafe { regolith_txn_free(txn, ptr::null_mut()) }, OK);
     assert_eq!(get(db, b"f"), Err(NOT_FOUND));
 
     close(db);
@@ -1712,13 +1744,6 @@ fn assert_store_works(dir: &TempDir, opts: &RegolithOptions, label: &str) {
         "{:?}",
         take_error(err)
     );
-    let mut err: *mut RegolithError = ptr::null_mut();
-    assert_eq!(
-        unsafe { regolith_txn_free(txn, &raw mut err) },
-        OK,
-        "{:?}",
-        take_error(err)
-    );
     assert_eq!(get(db, b"t").unwrap(), b"tv");
 
     close(db);
@@ -1883,8 +1908,6 @@ fn write_skew(dir: &TempDir, opts: *const RegolithOptions) -> i32 {
     // A conflict carries no detail (C-6); free whatever is there either way.
     take_error(err);
 
-    assert_eq!(unsafe { regolith_txn_free(first, ptr::null_mut()) }, OK);
-    assert_eq!(unsafe { regolith_txn_free(second, ptr::null_mut()) }, OK);
     close(db);
     status
 }
@@ -1942,8 +1965,6 @@ fn serializable_still_conflicts_on_a_write_write_overlap() {
         unsafe { regolith_txn_commit(second, ptr::null_mut()) },
         TXN_CONFLICT
     );
-    assert_eq!(unsafe { regolith_txn_free(first, ptr::null_mut()) }, OK);
-    assert_eq!(unsafe { regolith_txn_free(second, ptr::null_mut()) }, OK);
     assert_eq!(get(db, b"k").unwrap(), b"v1");
 
     close(db);
