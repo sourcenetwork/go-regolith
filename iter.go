@@ -65,12 +65,6 @@ type Iter struct {
 	// there is nothing left to ask for.
 	done bool
 
-	// val and valLen are the out-params for [Iter.Value], fields rather than
-	// locals because a local whose address crosses to C escapes and so costs an
-	// allocation on every call.  They hold nothing between calls.
-	val    *C.uint8_t
-	valLen C.size_t
-
 	// closed makes a second [Iter.Close] a no-op rather than a double free.
 	closed atomic.Bool
 }
@@ -104,14 +98,15 @@ func (it *Iter) Next() (bool, error) {
 func (it *Iter) refill() (bool, error) {
 	var out *C.uint8_t
 	var outLen, count C.size_t
+	var cerr *C.RegolithError
 
-	status := C.regolith_iter_next_batch(it.i, C.size_t(batchEntries), &out, &outLen, &count)
+	status := C.regolith_iter_next_batch(it.i, C.size_t(batchEntries), &out, &outLen, &count, &cerr)
 
 	// The batch is gone either way: on a failure nothing was handed over, and on
 	// success it is about to be replaced.
 	it.ents, it.pos = it.ents[:0], 0
 
-	frame, err := takeBuf(out, outLen, status)
+	frame, err := takeBuf(out, outLen, status, cerr)
 	if err != nil {
 		return false, err
 	}
@@ -150,8 +145,9 @@ func (it *Iter) Seek(key []byte) (bool, error) {
 	it.invalidate()
 
 	var valid C.uint8_t
-	status := C.regolith_iter_seek(it.i, bytePtr(key), C.size_t(len(key)), &valid)
-	if err := statusToErr(status); err != nil {
+	var cerr *C.RegolithError
+	status := C.regolith_iter_seek(it.i, bytePtr(key), C.size_t(len(key)), &valid, &cerr)
+	if err := statusToErr(status, cerr); err != nil {
 		return false, err
 	}
 	if valid == 0 {
@@ -178,7 +174,7 @@ func (it *Iter) Reset() {
 
 	// The status is not reported, and the call can only fail on a handle that is
 	// already unusable.
-	C.regolith_iter_reset(it.i)
+	C.regolith_iter_reset(it.i, nil)
 }
 
 // invalidate drops the current batch, which a seek or a reset makes stale on
@@ -217,17 +213,24 @@ func (it *Iter) Value() ([]byte, error) {
 		return nil, nil
 	}
 
+	// Locals, not fields: with #cgo noescape/nocallback these do not escape to
+	// the heap, so there is nothing left to gain from holding them on the
+	// iterator between calls.
+	var val *C.uint8_t
+	var valLen C.size_t
+	var cerr *C.RegolithError
+
 	// Borrowed, not owned: the FFI layer is holding a reference to these bytes
 	// on behalf of the current batch, so there is nothing to free.
-	status := C.regolith_iter_batch_value(it.i, C.size_t(it.pos), &it.val, &it.valLen)
-	if err := statusToErr(status); err != nil {
+	status := C.regolith_iter_batch_value(it.i, C.size_t(it.pos), &val, &valLen, &cerr)
+	if err := statusToErr(status, cerr); err != nil {
 		return nil, err
 	}
-	if it.valLen == 0 {
+	if valLen == 0 {
 		return nil, nil
 	}
 
-	return C.GoBytes(unsafe.Pointer(it.val), C.int(it.valLen)), nil
+	return C.GoBytes(unsafe.Pointer(val), C.int(valLen)), nil
 }
 
 // Close releases the iterator.  Closing an already closed iterator is a no-op.
@@ -239,7 +242,9 @@ func (it *Iter) Close() error {
 		return nil
 	}
 
-	return statusToErr(C.regolith_iter_close(it.i))
+	var cerr *C.RegolithError
+
+	return statusToErr(C.regolith_iter_close(it.i, &cerr), cerr)
 }
 
 // BorrowValue hands the value at the current iterator location to fn without
@@ -321,17 +326,21 @@ func (it *Iter) borrowValue(fn func(value []byte) error) error {
 		return fn(nil)
 	}
 
+	var val *C.uint8_t
+	var valLen C.size_t
+	var cerr *C.RegolithError
+
 	// Borrowed, not owned: the FFI layer is holding a reference to these bytes
 	// on behalf of the current batch, so there is nothing to free.
-	status := C.regolith_iter_batch_value(it.i, C.size_t(it.pos), &it.val, &it.valLen)
-	if err := statusToErr(status); err != nil {
+	status := C.regolith_iter_batch_value(it.i, C.size_t(it.pos), &val, &valLen, &cerr)
+	if err := statusToErr(status, cerr); err != nil {
 		return err
 	}
-	if it.valLen == 0 {
+	if valLen == 0 {
 		// An empty value has no owner to point at, and the FFI layer yields a nil
 		// pointer for it, which is not something to build a slice over.
 		return fn(nil)
 	}
 
-	return fn(unsafe.Slice((*byte)(unsafe.Pointer(it.val)), int(it.valLen)))
+	return fn(unsafe.Slice((*byte)(unsafe.Pointer(val)), int(valLen)))
 }

@@ -10,8 +10,8 @@ import (
 )
 
 // The errors returned by this package.  They are returned directly, or wrapped
-// with the detail string from `regolith_last_error_message` where the FFI layer
-// has one, so they are all usable with [errors.Is].
+// with the detail the FFI layer hands back alongside the status where the code
+// alone does not say what went wrong, so they are all usable with [errors.Is].
 var (
 	// ErrNotFound is returned when a key has no entry.
 	ErrNotFound = errors.New("key not found")
@@ -48,15 +48,21 @@ var (
 	ErrUnexpected = errors.New("regolith error")
 )
 
-// statusToErr maps a regolith status code onto the matching package error.
+// statusToErr maps a status code onto the matching package error.
 //
-// It must be called immediately after the failing FFI call and on the same
-// goroutine: the detail string for the codes that carry one lives in a
-// thread-local slot on the Rust side, and any further call on that thread
-// overwrites it.  Go may migrate a goroutine between OS threads at almost any
-// point, but not between two statements containing no function calls other than
-// these, which is why the read happens here and not later.
-func statusToErr(status C.int32_t) error {
+// detail is what the same call wrote to its error out-param: nil unless the
+// code is one of the three that carry a message, in which case the message is
+// wrapped into the error and the object is released here.  It arrives with the
+// status rather than through a second call, so there is nothing to read
+// promptly and nothing that another goroutine on the same thread could have
+// overwritten.
+func statusToErr(status C.int32_t, detail *C.RegolithError) error {
+	var message string
+	if detail != nil {
+		message = C.GoString(C.regolith_error_message(detail))
+		C.regolith_error_free(detail)
+	}
+
 	switch status {
 	case C.REGOLITH_OK:
 		return nil
@@ -71,22 +77,20 @@ func statusToErr(status C.int32_t) error {
 	case C.REGOLITH_ERR_DISCARDED:
 		return ErrDiscarded
 	case C.REGOLITH_ERR_INVALID_ARG:
-		return detailedErr(ErrInvalidArgument)
+		return withDetail(ErrInvalidArgument, message)
 	case C.REGOLITH_ERR_PANIC:
-		return detailedErr(ErrPanic)
+		return withDetail(ErrPanic, message)
 	default:
-		return detailedErr(ErrUnexpected)
+		return withDetail(ErrUnexpected, message)
 	}
 }
 
-// detailedErr wraps the given error with the last error detail recorded by the
-// Rust side, if there is one.
-func detailedErr(err error) error {
-	message := C.regolith_last_error_message()
-	if message == nil {
+// withDetail wraps err with the detail message, or returns it bare when there
+// is none.
+func withDetail(err error, message string) error {
+	if message == "" {
 		return err
 	}
-	defer C.regolith_free_string(message)
 
-	return fmt.Errorf("%w: %s", err, C.GoString(message))
+	return fmt.Errorf("%w: %s", err, message)
 }

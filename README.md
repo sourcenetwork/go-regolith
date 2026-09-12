@@ -6,8 +6,8 @@ embedded key-value engine written in Rust.
 The engine is reached through the hand-written C ABI in `ffi/`, a small Rust
 staticlib crate that wraps the `regolith` crate and is linked into your binary
 with cgo. The Go API on top of it is a plain, framework-free key-value store:
-`Get`/`Set`/`Has`/`Delete`, ordered iteration, and optimistic transactions with
-snapshot isolation.
+`Get`/`Set`/`Has`/`Delete`, ordered iteration, atomic batch writes, and
+optimistic transactions with snapshot isolation.
 
 ## Build requirement (read this first)
 
@@ -85,6 +85,16 @@ func main() {
 		log.Fatal(err)
 	}
 
+	// A batch: many sets and deletes applied atomically in one call, with the
+	// store's durability.  Faster than a transaction for a grouped write, but
+	// nothing is validated against concurrent writers.
+	batch := regolith.NewWriteBatch(0)
+	batch.Set([]byte("b"), []byte("2"))
+	batch.Delete([]byte("a"))
+	if err := db.Write(batch); err != nil {
+		log.Fatal(err)
+	}
+
 	// Ordered iteration, over a snapshot taken when the iterator is created.
 	it, err := db.NewIter(regolith.IterOptions{Prefix: []byte("h")})
 	if err != nil {
@@ -136,6 +146,23 @@ absence of one, so it cannot double as "leave it alone". An invalid value is
 rejected with an error naming the field, never clamped, and regolith validates
 before touching the filesystem, so a rejected open creates nothing.
 
+## Batch writes
+
+`WriteBatch` collects sets and deletes with `Set` and `Delete`, and `DB.Write`
+applies them in one call: every op lands or none does, as one write-ahead log
+record, with the same durability as `Set`. There is no conflict detection and
+no snapshot - a batch is not a transaction - and ops on the same key apply in
+the order they were added, so the last one wins. Call `Reset` to reuse a
+batch, and watch `Size` to bound how much memory it holds.
+
+That one write-ahead log record is capped by the engine at 1073741824 bytes
+(1 GiB), and `DB.Write` rejects a batch that would cross it with
+`ErrInvalidArgument` before writing anything, rather than writing and later
+losing it on a crash and reopen. The record is not `Size`: it runs `Size`
+bytes plus 8 for every set, 12 for every delete, plus 4, so split a batch
+into smaller ones well before `Size` alone reaches 1 GiB. See
+`WriteBatch.Size` for the exact rule.
+
 ## Handle ordering
 
 The FFI layer owns real Rust handles, and they have to be released in order:
@@ -145,14 +172,15 @@ The FFI layer owns real Rust handles, and they have to be released in order:
 2. Every `Txn` and `Iter` must be resolved before `DB.Close`.
 
 `Close`, `Commit` and `Discard` are each safe to call more than once; a second
-call is a no-op (`Commit` after a resolution returns `ErrDiscarded`).
+call is a no-op (`Commit` after a resolution returns `ErrDiscarded`). Each of
+`Commit` and `Discard` is a single call into the engine.
 
 ## Errors
 
 All errors are sentinel values usable with `errors.Is`: `ErrNotFound`,
 `ErrClosed`, `ErrConflict`, `ErrReadOnly`, `ErrDiscarded`, plus
 `ErrInvalidArgument`, `ErrPanic` and `ErrUnexpected`, which are wrapped with the
-detail string the FFI layer records.
+detail the FFI layer hands back with the status.
 
 ## Make targets
 

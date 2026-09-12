@@ -40,10 +40,7 @@ use std::sync::Arc;
 use regolith::{DbSlice, OwnedSnapshotIter, ScanDirection, Snapshot, TxnScanStream};
 
 use crate::txn::TxnInner;
-use crate::{
-    INVALID_ARG, NOT_FOUND, OK, OTHER, guard, in_opt_bytes, out_bool, out_bytes, set_error,
-    status_of,
-};
+use crate::{Failure, NOT_FOUND, RegolithError, guard, in_opt_bytes, out_bool, out_bytes};
 
 /// Iteration options, laid out for C. A byte range is absent when its
 /// pointer is null or its length is zero.
@@ -119,14 +116,14 @@ fn prefix_end(prefix: &[u8]) -> Option<Vec<u8>> {
 /// # Safety
 /// `opts` must be null or point at a valid struct whose byte pointers are
 /// valid for their stated lengths.
-pub(crate) unsafe fn bounds_from(opts: *const RegolithIterOptions) -> Result<Bounds, i32> {
+pub(crate) unsafe fn bounds_from(opts: *const RegolithIterOptions) -> Bounds {
     let Some(opts) = (unsafe { opts.as_ref() }) else {
-        return Ok(Bounds {
+        return Bounds {
             start: None,
             end: None,
             reverse: false,
             keys_only: false,
-        });
+        };
     };
 
     let prefix = unsafe { in_opt_bytes(opts.prefix, opts.prefix_len) };
@@ -139,12 +136,12 @@ pub(crate) unsafe fn bounds_from(opts: *const RegolithIterOptions) -> Result<Bou
         ),
     };
 
-    Ok(Bounds {
+    Bounds {
         start,
         end,
         reverse: opts.reverse != 0,
         keys_only: opts.keys_only != 0,
-    })
+    }
 }
 
 /// Where the entries come from.
@@ -207,7 +204,7 @@ pub struct RegolithIter {
     batch_count: usize,
     /// A read error hit part way through a batch, reported on the next
     /// call so the entries already gathered are not thrown away.
-    pending: Option<i32>,
+    pending: Option<Failure>,
 }
 
 impl RegolithIter {
@@ -223,7 +220,7 @@ impl RegolithIter {
         }
     }
 
-    pub(crate) fn over_txn(txn: Arc<TxnInner>, bounds: Bounds) -> Result<Self, i32> {
+    pub(crate) fn over_txn(txn: Arc<TxnInner>, bounds: Bounds) -> Result<Self, Failure> {
         // Fail fast if the transaction is already resolved, rather than
         // handing back a handle that can never yield anything.
         txn.with(|_| ())?;
@@ -243,7 +240,7 @@ impl RegolithIter {
     }
 
     /// Position on the first in-range entry.
-    fn restart(&mut self) -> Result<bool, i32> {
+    fn restart(&mut self) -> Result<bool, Failure> {
         if matches!(self.source, Source::Txn { .. }) {
             let (start, end) = (self.bounds.start.clone(), self.bounds.end.clone());
             self.rebuild(start.as_deref(), end.as_deref())?;
@@ -279,7 +276,7 @@ impl RegolithIter {
     }
 
     /// Advance one entry in the iteration direction.
-    fn step(&mut self) -> Result<bool, i32> {
+    fn step(&mut self) -> Result<bool, Failure> {
         if matches!(self.source, Source::Txn { .. }) {
             return self.pull();
         }
@@ -301,7 +298,7 @@ impl RegolithIter {
     }
 
     /// Position on the entry `Seek` should land on, clamped to the range.
-    fn seek(&mut self, target: &[u8]) -> Result<bool, i32> {
+    fn seek(&mut self, target: &[u8]) -> Result<bool, Failure> {
         self.reset = false;
         self.pending = None;
         self.invalidate_batch();
@@ -316,7 +313,7 @@ impl RegolithIter {
         }
     }
 
-    fn seek_forward(&mut self, target: &[u8]) -> Result<bool, i32> {
+    fn seek_forward(&mut self, target: &[u8]) -> Result<bool, Failure> {
         // Never yield below `start`, so a target under it becomes `start`.
         let clamped: Vec<u8> = match &self.bounds.start {
             Some(start) if target < start.as_slice() => start.clone(),
@@ -336,7 +333,7 @@ impl RegolithIter {
         self.cursor_valid()
     }
 
-    fn seek_reverse(&mut self, target: &[u8]) -> Result<bool, i32> {
+    fn seek_reverse(&mut self, target: &[u8]) -> Result<bool, Failure> {
         // `end` is exclusive, so a target at or above it is the same as
         // starting the reverse walk from the top of the range.
         let above_end = match &self.bounds.end {
@@ -372,7 +369,7 @@ impl RegolithIter {
     }
 
     /// Rebuild the transaction scan stream over a new range.
-    fn rebuild(&mut self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<(), i32> {
+    fn rebuild(&mut self, start: Option<&[u8]>, end: Option<&[u8]>) -> Result<(), Failure> {
         let direction = self.bounds.direction();
         let Source::Txn {
             txn,
@@ -414,7 +411,7 @@ impl RegolithIter {
     }
 
     /// Pull the next entry from the transaction stream into `current`.
-    fn pull(&mut self) -> Result<bool, i32> {
+    fn pull(&mut self) -> Result<bool, Failure> {
         let keys_only = self.bounds.keys_only;
         let Source::Txn {
             stream, current, ..
@@ -441,7 +438,7 @@ impl RegolithIter {
                 *current = None;
                 match status {
                     Ok(()) => Ok(false),
-                    Err(e) => Err(status_of(&e)),
+                    Err(e) => Err(e.into()),
                 }
             }
         }
@@ -459,7 +456,7 @@ impl RegolithIter {
     }
 
     /// Validity of the snapshot cursor after a move, surfacing read errors.
-    fn cursor_valid(&self) -> Result<bool, i32> {
+    fn cursor_valid(&self) -> Result<bool, Failure> {
         let Source::Snapshot(cursor) = &self.source else {
             unreachable!("cursor_valid is only for the snapshot source");
         };
@@ -470,7 +467,7 @@ impl RegolithIter {
         // `status` is the only thing that tells them apart.
         match cursor.status() {
             Ok(()) => Ok(false),
-            Err(e) => Err(status_of(&e)),
+            Err(e) => Err(e.into()),
         }
     }
 
@@ -516,7 +513,7 @@ impl RegolithIter {
     }
 
     /// Move onto the entry a batch's `n`th iteration should frame.
-    fn advance_in_batch(&mut self) -> Result<bool, i32> {
+    fn advance_in_batch(&mut self) -> Result<bool, Failure> {
         if self.reset {
             self.reset = false;
             self.include_current = false;
@@ -535,10 +532,7 @@ macro_rules! iter_ref {
     ($ptr:expr) => {
         match unsafe { $ptr.as_mut() } {
             Some(it) => it,
-            None => {
-                set_error("null iterator handle");
-                return INVALID_ARG;
-            }
+            None => return Err(Failure::invalid_arg("null iterator handle")),
         }
     };
 }
@@ -549,24 +543,26 @@ macro_rules! iter_ref {
 /// positions at the start of the range instead of advancing.
 ///
 /// # Safety
-/// `it` must be a live handle; `valid` must be writable.
+/// `it` must be a live handle; `valid` must be writable. `err` must be
+/// null or writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn regolith_iter_next(it: *mut RegolithIter, valid: *mut u8) -> i32 {
-    guard(|| {
+pub unsafe extern "C" fn regolith_iter_next(
+    it: *mut RegolithIter,
+    valid: *mut u8,
+    err: *mut *mut RegolithError,
+) -> i32 {
+    guard(err, || {
         let iter = iter_ref!(it);
         // Single-entry stepping ignores a pending seek position: its
         // contract is that a `next` after a `seek` advances from there.
         iter.include_current = false;
-        let moved = if iter.reset {
+        let is_valid = if iter.reset {
             iter.reset = false;
-            iter.restart()
+            iter.restart()?
         } else {
-            iter.step()
+            iter.step()?
         };
-        match moved {
-            Ok(is_valid) => unsafe { out_bool(is_valid, valid) },
-            Err(status) => status,
-        }
+        unsafe { out_bool(is_valid, valid) }
     })
 }
 
@@ -575,23 +571,22 @@ pub unsafe extern "C" fn regolith_iter_next(it: *mut RegolithIter, valid: *mut u
 ///
 /// # Safety
 /// `key` must be valid for `key_len` bytes; `valid` must be writable.
+/// `err` must be null or writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn regolith_iter_seek(
     it: *mut RegolithIter,
     key: *const u8,
     key_len: usize,
     valid: *mut u8,
+    err: *mut *mut RegolithError,
 ) -> i32 {
-    guard(|| {
+    guard(err, || {
         let iter = iter_ref!(it);
         let Some(key) = (unsafe { crate::in_bytes(key, key_len) }) else {
-            set_error("null key");
-            return INVALID_ARG;
+            return Err(Failure::invalid_arg("null key"));
         };
-        match iter.seek(key) {
-            Ok(is_valid) => unsafe { out_bool(is_valid, valid) },
-            Err(status) => status,
-        }
+        let is_valid = iter.seek(key)?;
+        unsafe { out_bool(is_valid, valid) }
     })
 }
 
@@ -599,16 +594,19 @@ pub unsafe extern "C" fn regolith_iter_seek(
 /// returns to the start of the range.
 ///
 /// # Safety
-/// `it` must be a live handle.
+/// `it` must be a live handle. `err` must be null or writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn regolith_iter_reset(it: *mut RegolithIter) -> i32 {
-    guard(|| {
+pub unsafe extern "C" fn regolith_iter_reset(
+    it: *mut RegolithIter,
+    err: *mut *mut RegolithError,
+) -> i32 {
+    guard(err, || {
         let iter = iter_ref!(it);
         iter.reset = true;
         iter.include_current = false;
         iter.pending = None;
         iter.invalidate_batch();
-        OK
+        Ok(())
     })
 }
 
@@ -616,22 +614,24 @@ pub unsafe extern "C" fn regolith_iter_reset(it: *mut RegolithIter) -> i32 {
 /// not on a valid entry.
 ///
 /// # Safety
-/// `key`/`key_len` must be writable. On [`OK`] the caller owns the buffer
-/// and releases it with `regolith_free_buf`.
+/// `key`/`key_len` must be writable. On [`OK`](crate::OK) the caller
+/// owns the buffer and releases it with `regolith_free_buf`. `err` must
+/// be null or writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn regolith_iter_key(
     it: *mut RegolithIter,
     key: *mut *mut u8,
     key_len: *mut usize,
+    err: *mut *mut RegolithError,
 ) -> i32 {
-    guard(|| {
+    guard(err, || {
         let iter = iter_ref!(it);
         match iter.current_key() {
             Some(current) => {
                 let copied = current.to_vec();
                 unsafe { out_bytes(copied, key, key_len) }
             }
-            None => NOT_FOUND,
+            None => Err(Failure::code(NOT_FOUND)),
         }
     })
 }
@@ -640,17 +640,18 @@ pub unsafe extern "C" fn regolith_iter_key(
 /// Returns [`NOT_FOUND`] when the iterator is not on a valid entry.
 ///
 /// # Safety
-/// As [`regolith_iter_key`].
+/// As [`regolith_iter_key`]. `err` must be null or writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn regolith_iter_value(
     it: *mut RegolithIter,
     val: *mut *mut u8,
     val_len: *mut usize,
+    err: *mut *mut RegolithError,
 ) -> i32 {
-    guard(|| {
+    guard(err, || {
         let iter = iter_ref!(it);
         if !iter.in_range() {
-            return NOT_FOUND;
+            return Err(Failure::code(NOT_FOUND));
         }
         // `KeysOnly` yields an empty buffer rather than an error: the Go
         // side's contract is `nil, nil`.
@@ -671,7 +672,7 @@ pub unsafe extern "C" fn regolith_iter_value(
 ///
 /// `*out_count == 0` is the only signal that the range is exhausted. A
 /// short batch does not mean exhaustion: it can also be the retained
-/// value cap ([`MAX_BATCH_VALUE_BYTES`]) or a read error being held back
+/// value cap (`MAX_BATCH_VALUE_BYTES`) or a read error being held back
 /// until the next call.
 ///
 /// Values are not framed. One [`DbSlice`] per entry is retained instead,
@@ -680,8 +681,8 @@ pub unsafe extern "C" fn regolith_iter_value(
 ///
 /// # Safety
 /// `it` must be a live handle; `out`, `out_len` and `out_count` must be
-/// writable. On [`OK`] the caller owns `(*out, *out_len)` and releases
-/// it with `regolith_free_buf`.
+/// writable. On [`OK`](crate::OK) the caller owns `(*out, *out_len)` and
+/// releases it with `regolith_free_buf`. `err` must be null or writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn regolith_iter_next_batch(
     it: *mut RegolithIter,
@@ -689,23 +690,22 @@ pub unsafe extern "C" fn regolith_iter_next_batch(
     out: *mut *mut u8,
     out_len: *mut usize,
     out_count: *mut usize,
+    err: *mut *mut RegolithError,
 ) -> i32 {
-    guard(|| {
+    guard(err, || {
         let iter = iter_ref!(it);
         if out.is_null() || out_len.is_null() || out_count.is_null() {
-            set_error("null out-param");
-            return INVALID_ARG;
+            return Err(Failure::invalid_arg("null out-param"));
         }
         if max_entries == 0 {
             // An empty batch is indistinguishable from exhaustion, so
             // asking for one is a caller bug rather than a no-op.
-            set_error("max_entries must be at least 1");
-            return INVALID_ARG;
+            return Err(Failure::invalid_arg("max_entries must be at least 1"));
         }
         // The previous batch's values stop being addressable here.
         iter.invalidate_batch();
-        if let Some(status) = iter.pending.take() {
-            return status;
+        if let Some(failure) = iter.pending.take() {
+            return Err(failure);
         }
 
         let mut frame: Vec<u8> = Vec::new();
@@ -715,21 +715,20 @@ pub unsafe extern "C" fn regolith_iter_next_batch(
             match iter.advance_in_batch() {
                 Ok(true) => {}
                 Ok(false) => break,
-                Err(status) => {
+                Err(failure) => {
                     if count == 0 {
-                        return status;
+                        return Err(failure);
                     }
                     // Hand back what was gathered and report the failure
                     // on the next call, so it is surfaced but nothing
                     // already walked is lost.
-                    iter.pending = Some(status);
+                    iter.pending = Some(failure);
                     break;
                 }
             }
             let Some(key) = iter.current_key() else { break };
             let Ok(key_len) = u32::try_from(key.len()) else {
-                set_error("key longer than 4 GiB");
-                return OTHER;
+                return Err(Failure::other("key longer than 4 GiB"));
             };
             frame.extend_from_slice(&key_len.to_le_bytes());
             frame.extend_from_slice(key);
@@ -756,29 +755,29 @@ pub unsafe extern "C" fn regolith_iter_next_batch(
 ///
 /// Under `KeysOnly` an in-range index yields `(null, 0)`, matching
 /// [`regolith_iter_value`]'s empty buffer. An index at or beyond the
-/// last batch's entry count is [`INVALID_ARG`].
+/// last batch's entry count is [`INVALID_ARG`](crate::INVALID_ARG).
 ///
 /// # Safety
 /// `it` must be a live handle and `val`/`val_len` writable. The returned
 /// pointer is valid until the next `regolith_iter_next_batch`,
 /// `regolith_iter_seek`, `regolith_iter_reset` or `regolith_iter_close`
-/// on this handle, and must not be freed.
+/// on this handle, and must not be freed. `err` must be null or
+/// writable.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn regolith_iter_batch_value(
     it: *mut RegolithIter,
     idx: usize,
     val: *mut *const u8,
     val_len: *mut usize,
+    err: *mut *mut RegolithError,
 ) -> i32 {
-    guard(|| {
+    guard(err, || {
         let iter = iter_ref!(it);
         if val.is_null() || val_len.is_null() {
-            set_error("null out-param");
-            return INVALID_ARG;
+            return Err(Failure::invalid_arg("null out-param"));
         }
         if idx >= iter.batch_count {
-            set_error("batch value index out of range");
-            return INVALID_ARG;
+            return Err(Failure::invalid_arg("batch value index out of range"));
         }
         let (ptr, len) = match iter.batch_values.get(idx) {
             Some(slice) => (slice.as_slice().as_ptr(), slice.len()),
@@ -789,7 +788,7 @@ pub unsafe extern "C" fn regolith_iter_batch_value(
             *val = ptr;
             *val_len = len;
         }
-        OK
+        Ok(())
     })
 }
 
@@ -797,15 +796,17 @@ pub unsafe extern "C" fn regolith_iter_batch_value(
 ///
 /// # Safety
 /// `it` must be a handle from `regolith_db_iter`/`regolith_txn_iter` that
-/// has not already been closed.
+/// has not already been closed. `err` must be null or writable.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn regolith_iter_close(it: *mut RegolithIter) -> i32 {
-    guard(|| {
+pub unsafe extern "C" fn regolith_iter_close(
+    it: *mut RegolithIter,
+    err: *mut *mut RegolithError,
+) -> i32 {
+    guard(err, || {
         if it.is_null() {
-            set_error("null iterator handle");
-            return INVALID_ARG;
+            return Err(Failure::invalid_arg("null iterator handle"));
         }
         drop(unsafe { Box::from_raw(it) });
-        OK
+        Ok(())
     })
 }

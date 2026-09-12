@@ -40,7 +40,7 @@
 
 use regolith::{CompressionType, DurabilityMode, IsolationLevel, Options};
 
-use crate::{INVALID_ARG, set_error};
+use crate::Failure;
 
 // ---------------------------------------------------------------------
 // Presence bits. Kept numerically identical to the header.
@@ -138,12 +138,11 @@ pub(crate) struct ResolvedOptions {
 ///
 /// Only reachable on a 32-bit host; there it is the difference between a
 /// clear rejection and a silently truncated budget.
-fn as_usize(name: &str, value: u64) -> Result<usize, i32> {
+fn as_usize(name: &str, value: u64) -> Result<usize, Failure> {
     usize::try_from(value).map_err(|_| {
-        set_error(format!(
+        Failure::invalid_arg(format!(
             "invalid option `{name}`: {value} does not fit in a usize on this platform"
-        ));
-        INVALID_ARG
+        ))
     })
 }
 
@@ -154,7 +153,9 @@ fn as_usize(name: &str, value: u64) -> Result<usize, i32> {
 /// # Safety
 /// `opts` must be null or point at a valid [`RegolithOptions`] for the
 /// duration of the call. Nothing is retained past it.
-pub(crate) unsafe fn options_from(opts: *const RegolithOptions) -> Result<ResolvedOptions, i32> {
+pub(crate) unsafe fn options_from(
+    opts: *const RegolithOptions,
+) -> Result<ResolvedOptions, Failure> {
     let mut resolved = ResolvedOptions::default();
     let Some(opts) = (unsafe { opts.as_ref() }) else {
         return Ok(resolved);
@@ -162,10 +163,9 @@ pub(crate) unsafe fn options_from(opts: *const RegolithOptions) -> Result<Resolv
 
     let unknown = opts.present & !OPT_KNOWN;
     if unknown != 0 {
-        set_error(format!(
+        return Err(Failure::invalid_arg(format!(
             "invalid option `present`: unknown presence bits {unknown:#x}"
-        ));
-        return Err(INVALID_ARG);
+        )));
     }
 
     if opts.present & OPT_WRITE_BUFFER_SIZE != 0 {
@@ -190,10 +190,9 @@ pub(crate) unsafe fn options_from(opts: *const RegolithOptions) -> Result<Resolv
             COMPRESSION_SNAPPY => CompressionType::Snappy,
             COMPRESSION_LZ4 => CompressionType::Lz4,
             other => {
-                set_error(format!(
+                return Err(Failure::invalid_arg(format!(
                     "invalid option `compression`: unknown codec {other}"
-                ));
-                return Err(INVALID_ARG);
+                )));
             }
         };
     }
@@ -202,8 +201,9 @@ pub(crate) unsafe fn options_from(opts: *const RegolithOptions) -> Result<Resolv
             DURABILITY_IMMEDIATE => DurabilityMode::Immediate,
             DURABILITY_EVENTUAL => DurabilityMode::Eventual,
             other => {
-                set_error(format!("invalid option `durability`: unknown mode {other}"));
-                return Err(INVALID_ARG);
+                return Err(Failure::invalid_arg(format!(
+                    "invalid option `durability`: unknown mode {other}"
+                )));
             }
         };
     }
@@ -213,8 +213,9 @@ pub(crate) unsafe fn options_from(opts: *const RegolithOptions) -> Result<Resolv
             ISOLATION_SNAPSHOT => IsolationLevel::SnapshotIsolation,
             ISOLATION_SERIALIZABLE => IsolationLevel::Serializable,
             other => {
-                set_error(format!("invalid option `isolation`: unknown level {other}"));
-                return Err(INVALID_ARG);
+                return Err(Failure::invalid_arg(format!(
+                    "invalid option `isolation`: unknown level {other}"
+                )));
             }
         };
     }
@@ -240,7 +241,7 @@ mod tests {
         }
     }
 
-    fn resolve(opts: &RegolithOptions) -> Result<ResolvedOptions, i32> {
+    fn resolve(opts: &RegolithOptions) -> Result<ResolvedOptions, Failure> {
         unsafe { options_from(opts) }
     }
 
@@ -394,30 +395,58 @@ mod tests {
 
     #[test]
     fn unknown_enum_discriminant_is_rejected_by_name() {
+        use crate::INVALID_ARG;
+
         let mut opts = empty();
         opts.present = OPT_COMPRESSION;
         opts.compression = 99;
-        assert_eq!(resolve(&opts).unwrap_err(), INVALID_ARG);
-        assert!(crate::tests::last_error().unwrap().contains("compression"));
+        let failure = resolve(&opts).unwrap_err();
+        assert_eq!(failure.status, INVALID_ARG);
+        assert!(
+            failure
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("compression"))
+        );
 
         let mut opts = empty();
         opts.present = OPT_DURABILITY;
         opts.durability = 7;
-        assert_eq!(resolve(&opts).unwrap_err(), INVALID_ARG);
-        assert!(crate::tests::last_error().unwrap().contains("durability"));
+        let failure = resolve(&opts).unwrap_err();
+        assert_eq!(failure.status, INVALID_ARG);
+        assert!(
+            failure
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("durability"))
+        );
 
         let mut opts = empty();
         opts.present = OPT_ISOLATION;
         opts.isolation = 3;
-        assert_eq!(resolve(&opts).unwrap_err(), INVALID_ARG);
-        assert!(crate::tests::last_error().unwrap().contains("isolation"));
+        let failure = resolve(&opts).unwrap_err();
+        assert_eq!(failure.status, INVALID_ARG);
+        assert!(
+            failure
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("isolation"))
+        );
     }
 
     #[test]
     fn unknown_presence_bit_is_rejected() {
+        use crate::INVALID_ARG;
+
         let mut opts = empty();
         opts.present = 1 << 40;
-        assert_eq!(resolve(&opts).unwrap_err(), INVALID_ARG);
-        assert!(crate::tests::last_error().unwrap().contains("present"));
+        let failure = resolve(&opts).unwrap_err();
+        assert_eq!(failure.status, INVALID_ARG);
+        assert!(
+            failure
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("present"))
+        );
     }
 }

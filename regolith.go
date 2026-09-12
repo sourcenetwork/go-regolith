@@ -14,10 +14,12 @@
 // # Usage
 //
 // Open a store with [Open], read and write through [DB], iterate with
-// [DB.NewIter], and group writes with [DB.NewTxn].  Transactions are optimistic
-// with snapshot isolation by default, so a commit that lost a validation race
-// returns [ErrConflict] and should be retried from a new transaction.  A store
-// opened with [OpenWith] can choose another level; see [Options.Isolation].
+// [DB.NewIter], and group writes with [DB.NewTxn] or apply many at once with
+// [DB.Write] and a [WriteBatch], which is atomic but not a transaction.
+// Transactions are optimistic with snapshot isolation by default, so a commit
+// that lost a validation race returns [ErrConflict] and should be retried
+// from a new transaction.  A store opened with [OpenWith] can choose another
+// level; see [Options.Isolation].
 //
 // # Limitations
 //
@@ -36,6 +38,67 @@ package regolith
 
 // #cgo CFLAGS: -I${SRCDIR}/ffi/include
 // #cgo LDFLAGS: ${SRCDIR}/ffi/target/release/libregolith_ffi.a
+//
+// /*
+//  * Every C function this package calls neither keeps a Go pointer past the
+//  * call nor calls back into Go, which is what the two directives below
+//  * assert per function.  With them the out-param locals below stay on the
+//  * goroutine's stack instead of escaping to the heap on every call.  cgo
+//  * rejects a directive naming a function this package does not call, so
+//  * the list has to track the calls exactly.
+//  */
+// #cgo noescape regolith_db_close
+// #cgo nocallback regolith_db_close
+// #cgo noescape regolith_db_delete
+// #cgo nocallback regolith_db_delete
+// #cgo noescape regolith_db_drop_all
+// #cgo nocallback regolith_db_drop_all
+// #cgo noescape regolith_db_get_borrowed
+// #cgo nocallback regolith_db_get_borrowed
+// #cgo noescape regolith_db_has
+// #cgo nocallback regolith_db_has
+// #cgo noescape regolith_db_iter
+// #cgo nocallback regolith_db_iter
+// #cgo noescape regolith_db_open_with_options
+// #cgo nocallback regolith_db_open_with_options
+// #cgo noescape regolith_db_set
+// #cgo nocallback regolith_db_set
+// #cgo noescape regolith_db_txn
+// #cgo nocallback regolith_db_txn
+// #cgo noescape regolith_db_write
+// #cgo nocallback regolith_db_write
+// #cgo noescape regolith_error_free
+// #cgo nocallback regolith_error_free
+// #cgo noescape regolith_error_message
+// #cgo nocallback regolith_error_message
+// #cgo noescape regolith_free_buf
+// #cgo nocallback regolith_free_buf
+// #cgo noescape regolith_iter_batch_value
+// #cgo nocallback regolith_iter_batch_value
+// #cgo noescape regolith_iter_close
+// #cgo nocallback regolith_iter_close
+// #cgo noescape regolith_iter_next_batch
+// #cgo nocallback regolith_iter_next_batch
+// #cgo noescape regolith_iter_reset
+// #cgo nocallback regolith_iter_reset
+// #cgo noescape regolith_iter_seek
+// #cgo nocallback regolith_iter_seek
+// #cgo noescape regolith_release_value
+// #cgo nocallback regolith_release_value
+// #cgo noescape regolith_txn_commit
+// #cgo nocallback regolith_txn_commit
+// #cgo noescape regolith_txn_delete
+// #cgo nocallback regolith_txn_delete
+// #cgo noescape regolith_txn_free
+// #cgo nocallback regolith_txn_free
+// #cgo noescape regolith_txn_get_borrowed
+// #cgo nocallback regolith_txn_get_borrowed
+// #cgo noescape regolith_txn_has
+// #cgo nocallback regolith_txn_has
+// #cgo noescape regolith_txn_iter
+// #cgo nocallback regolith_txn_iter
+// #cgo noescape regolith_txn_set
+// #cgo nocallback regolith_txn_set
 // #include <stdlib.h>
 // #include "regolith_ffi.h"
 import "C"
@@ -114,11 +177,12 @@ func OpenWith(path string, opts Options) (*DB, error) {
 	}
 
 	var db *C.RegolithDb
+	var cerr *C.RegolithError
 	status := C.regolith_db_open_with_options(
 		bytePtr(cPath), C.size_t(len(cPath)),
-		&cOpts, &db,
+		&cOpts, &db, &cerr,
 	)
-	if err := statusToErr(status); err != nil {
+	if err := statusToErr(status, cerr); err != nil {
 		return nil, err
 	}
 
@@ -139,13 +203,14 @@ func (db *DB) Get(key []byte) ([]byte, error) {
 	var val *C.uint8_t
 	var valLen C.size_t
 	var handle *C.RegolithValue
+	var cerr *C.RegolithError
 	status := C.regolith_db_get_borrowed(
 		db.db,
 		bytePtr(key), C.size_t(len(key)),
-		&val, &valLen, &handle,
+		&val, &valLen, &handle, &cerr,
 	)
 
-	return copyBorrowed(val, valLen, handle, status)
+	return copyBorrowed(val, valLen, handle, status, cerr)
 }
 
 // Has reports whether the given key has an entry.
@@ -157,8 +222,9 @@ func (db *DB) Has(key []byte) (bool, error) {
 	}
 
 	var found C.uint8_t
-	status := C.regolith_db_has(db.db, bytePtr(key), C.size_t(len(key)), &found)
-	if err := statusToErr(status); err != nil {
+	var cerr *C.RegolithError
+	status := C.regolith_db_has(db.db, bytePtr(key), C.size_t(len(key)), &found, &cerr)
+	if err := statusToErr(status, cerr); err != nil {
 		return false, err
 	}
 
@@ -173,13 +239,15 @@ func (db *DB) Set(key, value []byte) error {
 		return ErrClosed
 	}
 
+	var cerr *C.RegolithError
 	status := C.regolith_db_set(
 		db.db,
 		bytePtr(key), C.size_t(len(key)),
 		bytePtr(value), C.size_t(len(value)),
+		&cerr,
 	)
 
-	return statusToErr(status)
+	return statusToErr(status, cerr)
 }
 
 // Delete removes the entry at the given key.  Deleting a key that has no entry
@@ -191,9 +259,38 @@ func (db *DB) Delete(key []byte) error {
 		return ErrClosed
 	}
 
-	status := C.regolith_db_delete(db.db, bytePtr(key), C.size_t(len(key)))
+	var cerr *C.RegolithError
+	status := C.regolith_db_delete(db.db, bytePtr(key), C.size_t(len(key)), &cerr)
 
-	return statusToErr(status)
+	return statusToErr(status, cerr)
+}
+
+// Write applies the batch atomically: every op lands or none does, with the
+// store's durability, in one crossing of the FFI boundary.  It does not
+// validate against concurrent writers; see [WriteBatch] for what a batch is
+// and is not.
+//
+// The batch is left as it was, so it can be inspected or written again; call
+// [WriteBatch.Reset] to reuse it.  A nil or empty batch writes nothing.
+//
+// A batch whose packed ops would push the engine's write-ahead log record
+// past 1073741824 bytes (1 GiB) is rejected with [ErrInvalidArgument] before
+// anything is written; see [WriteBatch.Size] for the exact rule, and split a
+// batch that large into smaller ones instead.
+func (db *DB) Write(b *WriteBatch) error {
+	db.closeLk.RLock()
+	defer db.closeLk.RUnlock()
+	if db.closed.Load() {
+		return ErrClosed
+	}
+	if b == nil || b.n == 0 {
+		return nil
+	}
+
+	var cerr *C.RegolithError
+	status := C.regolith_db_write(db.db, bytePtr(b.buf), C.size_t(len(b.buf)), &cerr)
+
+	return statusToErr(status, cerr)
 }
 
 // DropAll deletes every entry in the store.  The store stays usable afterwards.
@@ -204,7 +301,9 @@ func (db *DB) DropAll() error {
 		return ErrClosed
 	}
 
-	return statusToErr(C.regolith_db_drop_all(db.db))
+	var cerr *C.RegolithError
+
+	return statusToErr(C.regolith_db_drop_all(db.db, &cerr), cerr)
 }
 
 // Close closes the store and releases its handle.
@@ -220,8 +319,10 @@ func (db *DB) Close() error {
 		return nil
 	}
 
+	var cerr *C.RegolithError
+
 	// The handle is invalid after this call whatever it returns.
-	return statusToErr(C.regolith_db_close(db.db))
+	return statusToErr(C.regolith_db_close(db.db, &cerr), cerr)
 }
 
 // NewIter returns an iterator over a snapshot of the store taken now, so writes
@@ -242,8 +343,9 @@ func (db *DB) NewIter(opts IterOptions) (*Iter, error) {
 	defer cOpts.free()
 
 	var it *C.RegolithIter
-	status := C.regolith_db_iter(db.db, cOpts.opts, &it)
-	if err := statusToErr(status); err != nil {
+	var cerr *C.RegolithError
+	status := C.regolith_db_iter(db.db, cOpts.opts, &it, &cerr)
+	if err := statusToErr(status, cerr); err != nil {
 		return nil, err
 	}
 
@@ -265,8 +367,9 @@ func (db *DB) NewTxn(readOnly bool) (*Txn, error) {
 	}
 
 	var t *C.RegolithTxn
-	status := C.regolith_db_txn(db.db, cBool(readOnly), &t)
-	if err := statusToErr(status); err != nil {
+	var cerr *C.RegolithError
+	status := C.regolith_db_txn(db.db, cBool(readOnly), &t, &cerr)
+	if err := statusToErr(status, cerr); err != nil {
 		return nil, err
 	}
 
@@ -281,13 +384,14 @@ func (db *DB) NewTxn(readOnly bool) (*Txn, error) {
 // resolution is not concurrent with them.  Every [Iter] created from a
 // transaction must be closed before it is resolved.
 //
-// Handle lifecycle: `regolith_txn_commit` and `regolith_txn_discard` resolve the
-// transaction but leave the handle allocated, and `regolith_txn_free` must be
-// called exactly once per handle.  Both [Txn.Commit] and [Txn.Discard] therefore
-// free the handle themselves and mark the transaction resolved, and whichever of
-// the two is called second does nothing.  That covers the usual pattern of a
-// deferred `Discard` alongside a `Commit`, and it means a committed handle is
-// freed as soon as it becomes useless.
+// Handle lifecycle: `regolith_txn_commit` consumes and frees the handle, and
+// `regolith_txn_free` rolls back an unresolved transaction and frees it, so
+// each resolution is one crossing.  Whichever of [Txn.Commit] and
+// [Txn.Discard] runs first releases the handle and marks the transaction
+// resolved; the other then does nothing, which covers the usual pattern of a
+// deferred `Discard` alongside a `Commit`.  A resolved transaction holds no
+// handle at all, so no later call can reach freed memory: every operation
+// checks `resolved` under `lk` before touching the handle.
 type Txn struct {
 	t  *C.RegolithTxn
 	db *DB
@@ -333,13 +437,14 @@ func (t *Txn) Get(key []byte) ([]byte, error) {
 	var val *C.uint8_t
 	var valLen C.size_t
 	var handle *C.RegolithValue
+	var cerr *C.RegolithError
 	status := C.regolith_txn_get_borrowed(
 		t.t,
 		bytePtr(key), C.size_t(len(key)),
-		&val, &valLen, &handle,
+		&val, &valLen, &handle, &cerr,
 	)
 
-	return copyBorrowed(val, valLen, handle, status)
+	return copyBorrowed(val, valLen, handle, status, cerr)
 }
 
 // Has reports whether the given key has an entry as the transaction sees it.
@@ -350,8 +455,9 @@ func (t *Txn) Has(key []byte) (bool, error) {
 	defer t.lk.RUnlock()
 
 	var found C.uint8_t
-	status := C.regolith_txn_has(t.t, bytePtr(key), C.size_t(len(key)), &found)
-	if err := statusToErr(status); err != nil {
+	var cerr *C.RegolithError
+	status := C.regolith_txn_has(t.t, bytePtr(key), C.size_t(len(key)), &found, &cerr)
+	if err := statusToErr(status, cerr); err != nil {
 		return false, err
 	}
 
@@ -366,13 +472,15 @@ func (t *Txn) Set(key, value []byte) error {
 	}
 	defer t.lk.RUnlock()
 
+	var cerr *C.RegolithError
 	status := C.regolith_txn_set(
 		t.t,
 		bytePtr(key), C.size_t(len(key)),
 		bytePtr(value), C.size_t(len(value)),
+		&cerr,
 	)
 
-	return statusToErr(status)
+	return statusToErr(status, cerr)
 }
 
 // Delete buffers a delete of the given key.  Deleting a key that has no entry
@@ -383,9 +491,10 @@ func (t *Txn) Delete(key []byte) error {
 	}
 	defer t.lk.RUnlock()
 
-	status := C.regolith_txn_delete(t.t, bytePtr(key), C.size_t(len(key)))
+	var cerr *C.RegolithError
+	status := C.regolith_txn_delete(t.t, bytePtr(key), C.size_t(len(key)), &cerr)
 
-	return statusToErr(status)
+	return statusToErr(status, cerr)
 }
 
 // NewIter returns an iterator over the transaction: its buffered writes merged
@@ -408,8 +517,9 @@ func (t *Txn) NewIter(opts IterOptions) (*Iter, error) {
 	defer cOpts.free()
 
 	var it *C.RegolithIter
-	status := C.regolith_txn_iter(t.t, cOpts.opts, &it)
-	if err := statusToErr(status); err != nil {
+	var cerr *C.RegolithError
+	status := C.regolith_txn_iter(t.t, cOpts.opts, &it, &cerr)
+	if err := statusToErr(status, cerr); err != nil {
 		return nil, err
 	}
 
@@ -420,7 +530,8 @@ func (t *Txn) NewIter(opts IterOptions) (*Iter, error) {
 //
 // It returns [ErrConflict] when another writer touched a validated key first;
 // the transaction is resolved either way, and the work should be retried from a
-// new transaction.  A second resolution returns [ErrDiscarded].
+// new transaction.  A second resolution returns [ErrDiscarded].  The handle is
+// released by the commit itself, on success and on failure alike.
 func (t *Txn) Commit() error {
 	t.lk.Lock()
 	defer t.lk.Unlock()
@@ -431,14 +542,14 @@ func (t *Txn) Commit() error {
 		return ErrClosed
 	}
 
-	// The error detail has to be read before any other FFI call, hence the
-	// mapping happening before the handle is freed.
-	err := statusToErr(C.regolith_txn_commit(t.t))
+	var cerr *C.RegolithError
+	status := C.regolith_txn_commit(t.t, &cerr)
 
+	// The call freed the handle whatever it returned.
 	t.resolved = true
-	C.regolith_txn_free(t.t)
+	t.t = nil
 
-	return err
+	return statusToErr(status, cerr)
 }
 
 // Discard drops the transaction's buffered writes and releases its handle.
@@ -452,13 +563,14 @@ func (t *Txn) Discard() {
 		return
 	}
 
-	// `regolith_txn_discard` is idempotent and `regolith_txn_free` discards an
-	// unresolved transaction anyway, but discarding explicitly keeps the two
-	// steps legible.  Both are called even if the store has been closed, as the
-	// handle must be freed regardless and neither touches the store handle.
-	C.regolith_txn_discard(t.t)
+	// `regolith_txn_free` rolls back an unresolved transaction before
+	// releasing the handle, so one crossing resolves and frees.  It is
+	// called even if the store has been closed, as the handle must be
+	// freed regardless and it does not touch the store handle.  The
+	// status is not checked, hence the nil `err`.
+	C.regolith_txn_free(t.t, nil)
 	t.resolved = true
-	C.regolith_txn_free(t.t)
+	t.t = nil
 }
 
 // bytePtr returns a pointer to the first byte of the given slice, or nil if it
@@ -485,11 +597,11 @@ func cBool(b bool) C.uint8_t {
 }
 
 // takeBuf copies a buffer handed over by the FFI layer into Go memory and
-// releases it, mapping the given status.
+// releases it, mapping the given status and detail.
 //
 // Nothing is allocated on a non-OK status, so there is nothing to free then.
-func takeBuf(ptr *C.uint8_t, length C.size_t, status C.int32_t) ([]byte, error) {
-	if err := statusToErr(status); err != nil {
+func takeBuf(ptr *C.uint8_t, length C.size_t, status C.int32_t, detail *C.RegolithError) ([]byte, error) {
+	if err := statusToErr(status, detail); err != nil {
 		return nil, err
 	}
 	if length == 0 {
@@ -520,6 +632,7 @@ func copyBorrowed(
 	length C.size_t,
 	handle *C.RegolithValue,
 	status C.int32_t,
+	detail *C.RegolithError,
 ) ([]byte, error) {
 	// Releasing is a boundary crossing, and the FFI produces no handle for a
 	// miss or for a present-but-empty value, so a nil check here is worth about
@@ -529,7 +642,7 @@ func copyBorrowed(
 		defer C.regolith_release_value(handle)
 	}
 
-	if err := statusToErr(status); err != nil {
+	if err := statusToErr(status, detail); err != nil {
 		return nil, err
 	}
 	if length == 0 {
