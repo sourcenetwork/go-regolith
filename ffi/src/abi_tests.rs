@@ -1931,6 +1931,7 @@ fn each_isolation_level_changes_what_write_skew_does() {
         (ISOLATION_READ_COMMITTED, "read committed", OK),
         (ISOLATION_SNAPSHOT, "snapshot", OK),
         (ISOLATION_SERIALIZABLE, "serializable", TXN_CONFLICT),
+        (ISOLATION_REPEATABLE_READ, "repeatable read", TXN_CONFLICT),
     ] {
         let dir = TempDir::new().unwrap();
         let mut opts = no_options();
@@ -1976,6 +1977,7 @@ fn every_isolation_level_round_trips_into_a_working_store() {
         ISOLATION_READ_COMMITTED,
         ISOLATION_SNAPSHOT,
         ISOLATION_SERIALIZABLE,
+        ISOLATION_REPEATABLE_READ,
     ] {
         let dir = TempDir::new().unwrap();
         let mut opts = no_options();
@@ -1985,12 +1987,54 @@ fn every_isolation_level_round_trips_into_a_working_store() {
     }
 }
 
+/// A key a transactional iterator yielded that a concurrent commit then
+/// overwrote, with the transaction neither reading it on its own nor
+/// writing it. Returns the status of the commit: refused where a scanned
+/// key is validated, committed where a scan is recorded per stretch.
+fn scanned_key_overwritten(dir: &TempDir, level: u32) -> i32 {
+    let mut options = no_options();
+    options.present = OPT_ISOLATION;
+    options.isolation = level;
+    let db = open_with(dir, &raw const options).expect("open failed");
+    set(db, b"k", b"0");
+
+    let txn = begin(db, false);
+    let it = txn_iter(txn, &opts(None, None, None, false, false));
+    assert_eq!(keys(&drain(it)), ["k"], "the scan must yield k");
+    assert_eq!(unsafe { regolith_iter_close(it, ptr::null_mut()) }, OK);
+
+    set(db, b"k", b"1");
+    assert_eq!(txn_set(txn, b"other", b"1"), OK);
+
+    let mut err: *mut RegolithError = ptr::null_mut();
+    let status = unsafe { regolith_txn_commit(txn, &raw mut err) };
+    take_error(err);
+
+    close(db);
+    status
+}
+
+#[test]
+fn repeatable_read_commits_over_a_scanned_key_serializable_refuses() {
+    for (level, label, want) in [
+        (ISOLATION_SERIALIZABLE, "serializable", TXN_CONFLICT),
+        (ISOLATION_REPEATABLE_READ, "repeatable read", OK),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let status = scanned_key_overwritten(&dir, level);
+        assert_eq!(
+            status, want,
+            "{label}: commit after a scanned key was overwritten was {status}, want {want}"
+        );
+    }
+}
+
 #[test]
 fn an_unknown_isolation_level_is_rejected_with_the_field_named() {
     let dir = TempDir::new().unwrap();
     let mut opts = no_options();
     opts.present = OPT_ISOLATION;
-    opts.isolation = 3;
+    opts.isolation = 4;
 
     let Err((status, message)) = open_with(&dir, &raw const opts) else {
         panic!("expected the open to fail");

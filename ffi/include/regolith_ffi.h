@@ -229,7 +229,10 @@ typedef struct RegolithIterOptions {
  * write-write overlap and admitting write skew. REGOLITH_ISOLATION_
  * SERIALIZABLE additionally validates every key the transaction read, so
  * write skew aborts too, at the cost of a read-set-sized check on the
- * transaction that commits second.
+ * transaction that commits second. REGOLITH_ISOLATION_REPEATABLE_READ validates
+ * every key a point read returned the same way and records a
+ * transactional iterator's walk per stretch rather than per key, so a key
+ * the iterator merely yielded is never validated on its own.
  *
  * Invalid values are rejected, never clamped, and the detail message
  * names the offending field. An unknown enum value or presence bit is
@@ -263,10 +266,13 @@ typedef struct RegolithIterOptions {
 
 /* Values for RegolithOptions.isolation. What each level validates at
  * commit: only what the transaction wrote; that plus keys read for
- * update (regolith's default); or the entire read set. */
+ * update (regolith's default); the entire read set; or every key a point
+ * read returned, with an iterator's walk recorded per stretch rather than
+ * per key. */
 #define REGOLITH_ISOLATION_READ_COMMITTED 0
 #define REGOLITH_ISOLATION_SNAPSHOT 1
 #define REGOLITH_ISOLATION_SERIALIZABLE 2
+#define REGOLITH_ISOLATION_REPEATABLE_READ 3
 
 typedef struct RegolithOptions {
   uint64_t present;

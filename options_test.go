@@ -88,6 +88,7 @@ func TestOpenWithEachFieldProducesAWorkingStore(t *testing.T) {
 		"IsolationReadCommitted":   {Isolation: IsolationReadCommitted},
 		"IsolationSnapshot":        {Isolation: IsolationSnapshot},
 		"IsolationSerializable":    {Isolation: IsolationSerializable},
+		"IsolationRepeatableRead":  {Isolation: IsolationRepeatableRead},
 		"Everything": {
 			WriteBufferSize:          Uint64(4 << 20),
 			BlockCacheSize:           Uint64(8 << 20),
@@ -267,10 +268,11 @@ func TestIsolationDecidesWhetherWriteSkewCommits(t *testing.T) {
 		conflic bool
 	}{
 		// Unset is the engine default, so the behaviour predates this option.
-		"Unset":         {Options{}, false},
-		"ReadCommitted": {Options{Isolation: IsolationReadCommitted}, false},
-		"Snapshot":      {Options{Isolation: IsolationSnapshot}, false},
-		"Serializable":  {Options{Isolation: IsolationSerializable}, true},
+		"Unset":          {Options{}, false},
+		"ReadCommitted":  {Options{Isolation: IsolationReadCommitted}, false},
+		"Snapshot":       {Options{Isolation: IsolationSnapshot}, false},
+		"Serializable":   {Options{Isolation: IsolationSerializable}, true},
+		"RepeatableRead": {Options{Isolation: IsolationRepeatableRead}, true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			err := writeSkew(t, test.opts)
@@ -314,5 +316,60 @@ func TestSerializableStillConflictsOnAWriteWriteOverlap(t *testing.T) {
 	}
 	if err := second.Commit(); !errors.Is(err, ErrConflict) {
 		t.Errorf("second commit: got %v, want a conflict", err)
+	}
+}
+
+// A key an iterator opened through [Txn.NewIter] yielded, replaced by a
+// concurrent write before the transaction commits, with the transaction
+// neither reading it on its own nor writing it.  IsolationSerializable
+// validates the scanned key and refuses the commit; IsolationRepeatableRead records
+// the walk per stretch and lets it through.
+func TestRepeatableReadCommitsOverAScannedKeySerializableRefuses(t *testing.T) {
+	for name, test := range map[string]struct {
+		level    Isolation
+		conflict bool
+	}{
+		"Serializable":   {IsolationSerializable, true},
+		"RepeatableRead": {IsolationRepeatableRead, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			db := openWith(t, Options{Isolation: test.level})
+			if err := db.Set([]byte("k"), []byte("0")); err != nil {
+				t.Fatalf("set: %v", err)
+			}
+
+			txn, err := db.NewTxn(false)
+			if err != nil {
+				t.Fatalf("new txn: %v", err)
+			}
+			defer txn.Discard()
+
+			it, err := txn.NewIter(IterOptions{})
+			if err != nil {
+				t.Fatalf("new iter: %v", err)
+			}
+			ok, err := it.Next()
+			if err != nil || !ok || string(it.Key()) != "k" {
+				t.Fatalf("the scan must yield k: ok=%v key=%q err=%v", ok, it.Key(), err)
+			}
+			if err := it.Close(); err != nil {
+				t.Fatalf("iter close: %v", err)
+			}
+
+			if err := db.Set([]byte("k"), []byte("1")); err != nil {
+				t.Fatalf("concurrent set: %v", err)
+			}
+			if err := txn.Set([]byte("other"), []byte("1")); err != nil {
+				t.Fatalf("txn set: %v", err)
+			}
+
+			err = txn.Commit()
+			switch {
+			case test.conflict && !errors.Is(err, ErrConflict):
+				t.Errorf("commit: got %v, want a conflict", err)
+			case !test.conflict && err != nil:
+				t.Errorf("commit: got %v, want it to commit", err)
+			}
+		})
 	}
 }

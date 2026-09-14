@@ -135,7 +135,9 @@ db, err := regolith.OpenWith("/tmp/my-store", regolith.Options{
 	// Validate every key a transaction read, not only the ones it wrote, so
 	// write skew aborts instead of committing.  Applies to every transaction the
 	// store begins: corekv's `NewTxn(readonly bool)` leaves no room for a
-	// per-transaction level.
+	// per-transaction level.  IsolationRepeatableRead keeps that for point reads and
+	// records an iterator's walk per stretch rather than per key, for a scan
+	// over a set that concurrent writers only ever add to or reclaim.
 	Isolation: regolith.IsolationSerializable,
 })
 ```
