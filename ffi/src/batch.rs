@@ -27,19 +27,18 @@ pub(crate) const OP_SET: u8 = 1;
 pub(crate) const OP_DELETE: u8 = 2;
 
 /// Largest write-ahead-log record the engine will accept for one batch,
-/// mirroring its own limit (regolith 0.1.4's private `MAX_RECORD_LEN`,
-/// `src/engine/wal.rs:117`, itself `1 << 30`). A batch whose engine-side
-/// record exceeds this is accepted and readable by `Db::write` today, but
-/// `WalReplayIter::next_entry_inner` (`src/engine/wal_replay.rs:218`)
-/// treats a stored length past it as a truncated read on reopen, so the
-/// whole record, and every op in it, is silently discarded after a crash.
-/// Rejecting it here, before any op reaches the engine, is what keeps a
-/// batch's atomicity promise: every op lands, or none does, and stays
-/// landed.
+/// mirroring its own limit (regolith 0.1.6's private `MAX_RECORD_LEN`,
+/// `src/engine/wal.rs:120`, itself `1 << 30`). Since 0.1.6 `Db::write`
+/// refuses a record past it through `check_write_len` (`src/lib.rs:999`);
+/// through 0.1.4 it accepted one, and `WalReplayIter::next_entry_inner`
+/// (`src/engine/wal_replay.rs:218`) then discarded the whole record after a
+/// crash. Checking here as well rejects the batch while it is still being
+/// decoded, before any op reaches the engine, so every op lands or none
+/// does.
 ///
 /// What this bounds is the record's payload, the length the record header
 /// stores and replay checks, not the 5-byte header and 4-byte checksum
-/// framed around it (`record_len`, `wal.rs:493-495`). Summed over a batch,
+/// framed around it (`record_len`, `wal.rs:501-505`). Summed over a batch,
 /// that payload is
 ///
 /// ```text
@@ -403,7 +402,8 @@ mod tests {
         // sixteenth tuned so the engine's record lands exactly on
         // MAX_BATCH_RECORD_LEN. The same shape measured end to end
         // against regolith 0.1.4: a record of exactly 1 << 30 bytes
-        // survives a crash and reopen, one byte more is lost.
+        // survives a crash and reopen, one byte more is lost. Since 0.1.6
+        // the engine refuses that one-byte-over record instead.
         let key_len = 5u64;
         let full_value_len = 64 * 1024 * 1024u64;
         let sets = 16u64;
