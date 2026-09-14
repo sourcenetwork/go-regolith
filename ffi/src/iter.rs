@@ -145,6 +145,9 @@ pub(crate) unsafe fn bounds_from(opts: *const RegolithIterOptions) -> Bounds {
 }
 
 /// Where the entries come from.
+// The whole iterator is already boxed behind the FFI handle, so the variant
+// size never lands on the stack.
+#[allow(clippy::large_enum_variant)]
 enum Source {
     /// A snapshot of the committed store. A real cursor, so seeking is
     /// cheap and in-place.
