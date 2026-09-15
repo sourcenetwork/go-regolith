@@ -125,12 +125,22 @@ const (
 	// IsolationSerializable validates every key the transaction read as well, so
 	// a concurrent commit to any of them aborts it and write skew is
 	// unreachable.  The cost is paid by the transaction committing second and is
-	// proportional to its read set.
-	//
-	// This covers point reads, which is all a transaction here can do: there is
-	// no transactional range scan, so a read set is a set of keys rather than a
-	// predicate.
+	// proportional to its read set, which includes every key an iterator opened
+	// through [Txn.NewIter] yielded.  A read set is a set of keys, not a
+	// predicate: a key inserted into a scanned range by a concurrent commit is
+	// not detected.
 	IsolationSerializable
+
+	// IsolationRepeatableRead validates every key a point read returned, as
+	// IsolationSerializable does, and records an iterator's walk per stretch
+	// rather than per key, so a key the iterator merely yielded is never
+	// validated on its own: Adya's PL-2.99 over snapshot isolation.  A key it
+	// yielded that the transaction then writes is still validated, through the
+	// write.  It is the level for a scan over a set that concurrent writers only
+	// ever add to or reclaim, such as a head set derived from keys: validated
+	// per key, that scan aborts writers no serial order needed to abort and
+	// costs one commit check per key walked.
+	IsolationRepeatableRead
 )
 
 // Presence bits for the C options struct, mirroring the REGOLITH_OPT_* macros
@@ -216,6 +226,9 @@ func (o Options) toC() (C.RegolithOptions, error) {
 	case IsolationSerializable:
 		c.present |= C.uint64_t(optIsolation)
 		c.isolation = C.REGOLITH_ISOLATION_SERIALIZABLE
+	case IsolationRepeatableRead:
+		c.present |= C.uint64_t(optIsolation)
+		c.isolation = C.REGOLITH_ISOLATION_REPEATABLE_READ
 	default:
 		return c, fmt.Errorf("%w: invalid option `Isolation`: unknown level %d",
 			ErrInvalidArgument, uint32(o.Isolation))

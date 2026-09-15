@@ -359,9 +359,9 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "regolith"
-version = "0.1.6"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7160a20fe77828dfb8734b791908f946e706946c0c7635ea481c6e4e63c0be13"
+checksum = "e381110c5c0dafdeaf27576e692557c4387dab8571abaee00ffad808a5561899"
 dependencies = [
  "js-sys",
  "kovan",

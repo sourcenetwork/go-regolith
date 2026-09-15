@@ -93,6 +93,9 @@ pub const ISOLATION_READ_COMMITTED: u32 = 0;
 pub const ISOLATION_SNAPSHOT: u32 = 1;
 /// Validate the transaction's entire read set.
 pub const ISOLATION_SERIALIZABLE: u32 = 2;
+/// Validate every key a point read returned; record a scan per stretch,
+/// not per key.
+pub const ISOLATION_REPEATABLE_READ: u32 = 3;
 
 /// Engine options, laid out for C.
 ///
@@ -212,6 +215,7 @@ pub(crate) unsafe fn options_from(
             ISOLATION_READ_COMMITTED => IsolationLevel::ReadCommitted,
             ISOLATION_SNAPSHOT => IsolationLevel::SnapshotIsolation,
             ISOLATION_SERIALIZABLE => IsolationLevel::Serializable,
+            ISOLATION_REPEATABLE_READ => IsolationLevel::RepeatableRead,
             other => {
                 return Err(Failure::invalid_arg(format!(
                     "invalid option `isolation`: unknown level {other}"
@@ -385,6 +389,7 @@ mod tests {
             (ISOLATION_READ_COMMITTED, IsolationLevel::ReadCommitted),
             (ISOLATION_SNAPSHOT, IsolationLevel::SnapshotIsolation),
             (ISOLATION_SERIALIZABLE, IsolationLevel::Serializable),
+            (ISOLATION_REPEATABLE_READ, IsolationLevel::RepeatableRead),
         ] {
             let mut opts = empty();
             opts.present = OPT_ISOLATION;
@@ -423,7 +428,7 @@ mod tests {
 
         let mut opts = empty();
         opts.present = OPT_ISOLATION;
-        opts.isolation = 3;
+        opts.isolation = 4;
         let failure = resolve(&opts).unwrap_err();
         assert_eq!(failure.status, INVALID_ARG);
         assert!(
